@@ -163,6 +163,7 @@ void EventBus::_emit(EventTypeId tid, const void* payload) {
         // applied in _flushPendingMutations after delivery.)
         e->invoke(payload);
     }
+    _totalDelivered.fetch_add(1, std::memory_order_relaxed);
     _deliveryDepth--;
     if (_deliveryDepth == 0) _flushPendingMutations();
 }
@@ -170,27 +171,77 @@ void EventBus::_emit(EventTypeId tid, const void* payload) {
 // -----------------------------------------------------------------------------
 // Post — queue for next pump. Safe from any thread.
 // -----------------------------------------------------------------------------
-void EventBus::_post(EventTypeId tid, EventPriority prio, std::vector<uint8_t> bytes) {
-    // Tag the bytes with the type id so pump can route without a typeid lookup.
-    struct Envelope {
-        EventTypeId tid;
-        uint32_t    payloadSize;
-        // payload follows contiguously
-    };
+// Packet layout (header is fixed-size; no dynamic fields):
+//   [EventTypeId tid][uint32_t payloadSize][uint64_t coalesceKey][uint8_t hasCoalesceKey][payload bytes]
+// Header size: 4 + 4 + 8 + 1 = 17, rounded up to 24 for alignment.
+namespace {
+struct PostEnvelope {
+    EventTypeId tid;
+    uint32_t    payloadSize;
+    uint64_t    coalesceKey;
+    uint8_t     hasCoalesceKey; // 0 = no coalesce, 1 = coalesce on key
+    uint8_t     _pad[7];        // align to 8 bytes
+};
+static_assert(sizeof(PostEnvelope) == 24, "PostEnvelope layout must match header packing");
+constexpr size_t kHeaderSize = sizeof(PostEnvelope);
+} // namespace
+
+void EventBus::_updatePeakDepth() {
+    size_t total = 0;
+    for (auto& q : _queues) total += q.size();
+    uint64_t cur = _peakQueueDepth.load(std::memory_order_relaxed);
+    while (static_cast<uint64_t>(total) > cur) {
+        if (_peakQueueDepth.compare_exchange_weak(cur, total, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
+void EventBus::_post(EventTypeId tid, EventPriority prio, uint64_t coalesceKey,
+                     bool hasCoalesceKey, std::vector<uint8_t> bytes) {
     size_t idx = static_cast<size_t>(prio);
     if (idx >= _queues.size()) idx = static_cast<size_t>(EventPriority::Normal);
 
-    // Prepend Envelope header.
-    std::vector<uint8_t> packet;
-    packet.resize(sizeof(Envelope) + bytes.size());
-    Envelope env{ tid, static_cast<uint32_t>(bytes.size()) };
-    std::memcpy(packet.data(), &env, sizeof(Envelope));
-    if (!bytes.empty()) {
-        std::memcpy(packet.data() + sizeof(Envelope), bytes.data(), bytes.size());
+    std::lock_guard<std::mutex> lk(_postMutex);
+
+    // Coalesce path (Phase 2 §4.2): scan current priority bucket for an
+    // existing pending packet with same TID + coalesceKey. If found, replace
+    // the payload in-place. This keeps FIFO position of the FIRST coalesce
+    // hit (so a coalesced event still fires in its original relative order,
+    // but with the latest payload).
+    if (hasCoalesceKey) {
+        auto& bucket = _queues[idx];
+        for (auto& packet : bucket) {
+            if (packet.size() < kHeaderSize) continue;
+            PostEnvelope existing;
+            std::memcpy(&existing, packet.data(), kHeaderSize);
+            if (existing.tid == tid && existing.hasCoalesceKey
+                && existing.coalesceKey == coalesceKey) {
+                // Replace payload bytes in-place. If sizes differ, resize.
+                packet.resize(kHeaderSize + bytes.size());
+                PostEnvelope newHeader = existing;
+                newHeader.payloadSize = static_cast<uint32_t>(bytes.size());
+                std::memcpy(packet.data(), &newHeader, kHeaderSize);
+                if (!bytes.empty()) {
+                    std::memcpy(packet.data() + kHeaderSize, bytes.data(), bytes.size());
+                }
+                _totalCoalesced.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
     }
 
-    std::lock_guard<std::mutex> lk(_postMutex);
+    // Fresh post path.
+    std::vector<uint8_t> packet(kHeaderSize + bytes.size());
+    PostEnvelope env{ tid, static_cast<uint32_t>(bytes.size()),
+                      coalesceKey, hasCoalesceKey ? 1 : 0, {0,0,0,0,0,0,0} };
+    std::memcpy(packet.data(), &env, kHeaderSize);
+    if (!bytes.empty()) {
+        std::memcpy(packet.data() + kHeaderSize, bytes.data(), bytes.size());
+    }
     _queues[idx].push_back(std::move(packet));
+    _totalPosted.fetch_add(1, std::memory_order_relaxed);
+    _updatePeakDepth();
 }
 
 // -----------------------------------------------------------------------------
@@ -222,13 +273,11 @@ void EventBus::pump() {
             anyDrained = true;
 
             for (auto& packet : batch) {
-                if (packet.size() < sizeof(EventTypeId) + sizeof(uint32_t)) continue;
-                EventTypeId tid;
-                uint32_t payloadSize;
-                std::memcpy(&tid, packet.data(), sizeof(EventTypeId));
-                std::memcpy(&payloadSize, packet.data() + sizeof(EventTypeId), sizeof(uint32_t));
-                const void* payload = packet.data() + sizeof(EventTypeId) + sizeof(uint32_t);
-                _emit(tid, payload);
+                if (packet.size() < kHeaderSize) continue;
+                PostEnvelope env;
+                std::memcpy(&env, packet.data(), kHeaderSize);
+                const void* payload = packet.data() + kHeaderSize;
+                _emit(env.tid, payload);
             }
         }
         if (!anyDrained) break;

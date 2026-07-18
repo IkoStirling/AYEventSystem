@@ -41,6 +41,12 @@ struct NormalEvent {
     static constexpr EventPriority kPriority = EventPriority::Normal;
 };
 
+struct CoalesceEvent {
+    int payload = 0;
+    static constexpr EventTypeId   kTypeId   = 0x0A00'0010;
+    static constexpr EventPriority kPriority = EventPriority::Normal;
+};
+
 // -----------------------------------------------------------------------------
 // §9 row 1: subscribe + emit
 // -----------------------------------------------------------------------------
@@ -467,6 +473,170 @@ TEST_CASE(ScopedConnectionReleaseNoUnsub) {
     bus.unsubscribe(id);
     bus.emit(SimpleEvent{0});
     CHECK_INT_EQ(count, 1);
+}
+
+TEST_SUITE_END
+
+// -----------------------------------------------------------------------------
+// Phase 2 §4.2 / §8 — coalesce + counters
+// -----------------------------------------------------------------------------
+TEST_SUITE(EventBus_Coalesce)
+
+// Singleton key=0: successive post_coalesce(0, ...) collapses into one
+// delivery with the latest payload (matches §4.2 "WindowResizeEvent" example).
+TEST_CASE(CoalesceSingletonKey) {
+    EventBus bus;
+    std::vector<int> seen;
+    bus.subscribe<CoalesceEvent>([&](const CoalesceEvent& e) {
+        seen.push_back(e.payload);
+    });
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{1});
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{2});
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{3});
+    CHECK_INT_EQ(static_cast<int>(bus.pendingCount()), 1);
+    bus.pump();
+    CHECK_INT_EQ(static_cast<int>(seen.size()), 1);
+    CHECK_INT_EQ(seen[0], 3); // latest wins
+    CHECK_INT_EQ(static_cast<int>(bus.totalCoalesced()), 2); // 2 prior replaced
+}
+
+TEST_CASE(CoalesceDistinctKeys) {
+    EventBus bus;
+    std::vector<std::pair<uint64_t, int>> seen;
+    bus.subscribe<CoalesceEvent>([&](const CoalesceEvent& e) {
+        // Payload encodes the original key in the high 16 bits for this test.
+        seen.push_back({static_cast<uint64_t>(e.payload) >> 16,
+                        e.payload & 0xFFFF});
+    });
+    // Two distinct keys → two pending items.
+    bus.post_coalesce<CoalesceEvent>(100, CoalesceEvent{100u << 16 | 1});
+    bus.post_coalesce<CoalesceEvent>(200, CoalesceEvent{200u << 16 | 1});
+    bus.post_coalesce<CoalesceEvent>(100, CoalesceEvent{100u << 16 | 2});
+    CHECK_INT_EQ(static_cast<int>(bus.pendingCount()), 2);
+    bus.pump();
+    // key=100 collapsed to latest; key=200 unchanged.
+    CHECK_INT_EQ(static_cast<int>(seen.size()), 2);
+    // Order: key=100 was posted first → drained first → payload 2.
+    CHECK_TRUE(seen[0].first == 100u);
+    CHECK_INT_EQ(static_cast<int>(seen[0].second), 2);
+    CHECK_TRUE(seen[1].first == 200u);
+    CHECK_INT_EQ(static_cast<int>(seen[1].second), 1);
+    CHECK_INT_EQ(static_cast<int>(bus.totalCoalesced()), 1);
+}
+
+TEST_CASE(CoalesceDoesNotMatchPlainPost) {
+    EventBus bus;
+    int count = 0;
+    bus.subscribe<CoalesceEvent>([&](const CoalesceEvent&) { ++count; });
+    // Mixed: one plain post + one coalesce(0). They MUST coexist (different
+    // buckets in our header layout: coalesce flag distinguishes them).
+    bus.post(CoalesceEvent{1});
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{2});
+    CHECK_INT_EQ(static_cast<int>(bus.pendingCount()), 2);
+    bus.pump();
+    CHECK_INT_EQ(count, 2);
+}
+
+TEST_CASE(CoalesceKeyZeroIsValid) {
+    // Regression: 0 is a real coalesce key, not a sentinel for "no coalesce".
+    EventBus bus;
+    int seen = 0;
+    bus.subscribe<CoalesceEvent>([&](const CoalesceEvent& e) { seen = e.payload; });
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{42});
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{99});
+    bus.pump();
+    CHECK_INT_EQ(seen, 99);
+}
+
+TEST_CASE(CoalesceCrossThread) {
+    EventBus bus;
+    std::atomic<int> count{0};
+    bus.subscribe<CoalesceEvent>([&](const CoalesceEvent&) { count.fetch_add(1); });
+    // 100 workers each posting 10 coalesce items with the SAME key →
+    // exactly one delivery total.
+    constexpr int kWorkers = 4;
+    constexpr int kPerWorker = 25;
+    std::vector<std::thread> ts;
+    std::atomic<bool> startGate{false};
+    for (int w = 0; w < kWorkers; ++w) {
+        ts.emplace_back([&] {
+            while (!startGate.load(std::memory_order_acquire)) {}
+            for (int i = 0; i < kPerWorker; ++i) {
+                bus.post_coalesce<CoalesceEvent>(7, CoalesceEvent{i});
+            }
+        });
+    }
+    startGate.store(true, std::memory_order_release);
+    for (auto& t : ts) t.join();
+    CHECK_INT_EQ(static_cast<int>(bus.pendingCount()), 1);
+    bus.pump();
+    CHECK_INT_EQ(count.load(), 1);
+}
+
+TEST_SUITE_END
+
+// -----------------------------------------------------------------------------
+// Phase 2 §8 counters
+// -----------------------------------------------------------------------------
+TEST_SUITE(EventBus_Counters)
+
+TEST_CASE(TotalPostedTracksPlainPost) {
+    EventBus bus;
+    CHECK_INT_EQ(static_cast<int>(bus.totalPosted()), 0);
+    bus.post(SimpleEvent{1});
+    bus.post(SimpleEvent{2});
+    bus.post(SimpleEvent{3});
+    CHECK_INT_EQ(static_cast<int>(bus.totalPosted()), 3);
+    CHECK_INT_EQ(static_cast<int>(bus.totalCoalesced()), 0);
+}
+
+TEST_CASE(TotalCoalescedTracksReplacements) {
+    EventBus bus;
+    bus.subscribe<CoalesceEvent>([](const CoalesceEvent&) {});
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{1}); // posted
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{2}); // coalesced
+    bus.post_coalesce<CoalesceEvent>(0, CoalesceEvent{3}); // coalesced
+    CHECK_INT_EQ(static_cast<int>(bus.totalPosted()), 1);
+    CHECK_INT_EQ(static_cast<int>(bus.totalCoalesced()), 2);
+}
+
+TEST_CASE(TotalDeliveredTracksPump) {
+    EventBus bus;
+    int got = 0;
+    bus.subscribe<SimpleEvent>([&](const SimpleEvent& e) { got = e.payload; });
+    bus.post(SimpleEvent{7});
+    bus.pump();
+    CHECK_INT_EQ(static_cast<int>(bus.totalDelivered()), 1);
+    CHECK_INT_EQ(got, 7);
+    bus.emit(SimpleEvent{8});
+    CHECK_INT_EQ(static_cast<int>(bus.totalDelivered()), 2);
+    CHECK_INT_EQ(got, 8);
+}
+
+TEST_CASE(PeakQueueDepth) {
+    EventBus bus;
+    CHECK_INT_EQ(static_cast<int>(bus.peakQueueDepth()), 0);
+    bus.post(SimpleEvent{1});
+    bus.post(SimpleEvent{2});
+    bus.post(SimpleEvent{3});
+    CHECK_INT_EQ(static_cast<int>(bus.peakQueueDepth()), 3);
+    bus.pump();
+    CHECK_INT_EQ(static_cast<int>(bus.pendingCount()), 0);
+    // Peak must persist (it's a "highest ever observed" metric).
+    CHECK_INT_EQ(static_cast<int>(bus.peakQueueDepth()), 3);
+}
+
+TEST_CASE(ResetCounters) {
+    EventBus bus;
+    bus.post(SimpleEvent{1});
+    bus.subscribe<SimpleEvent>([](const SimpleEvent&) {});
+    bus.emit(SimpleEvent{2});
+    CHECK_TRUE(bus.totalPosted() > 0 || bus.totalDelivered() > 0);
+    bus.resetCounters();
+    CHECK_INT_EQ(static_cast<int>(bus.totalPosted()), 0);
+    CHECK_INT_EQ(static_cast<int>(bus.totalCoalesced()), 0);
+    CHECK_INT_EQ(static_cast<int>(bus.totalDelivered()), 0);
+    CHECK_INT_EQ(static_cast<int>(bus.peakQueueDepth()), 0);
 }
 
 TEST_SUITE_END

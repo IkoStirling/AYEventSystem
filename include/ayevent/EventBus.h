@@ -100,8 +100,27 @@ public:
         // Serialize payload into bytes; queued vector owns its memory.
         std::vector<uint8_t> bytes(sizeof(TEvent));
         std::memcpy(bytes.data(), &event, sizeof(TEvent));
-        _post(tid, prio, std::move(bytes));
+        _post(tid, prio, /*coalesceKey=*/0, /*hasCoalesceKey=*/false, std::move(bytes));
         (void)event; // event was memcpy'd; prevent UB from moved-from copies.
+    }
+
+    // ----- Coalescing post (Phase 2 §4.2) -------------------------------------
+    // Among pending items of type T with the same key, keep only the latest
+    // (replace the existing pending payload). Useful for window resize /
+    // resource progress events where only the final state matters.
+    // Key 0 is reserved as a valid singleton key — every post uses hasCoalesceKey
+    // flag to distinguish "no coalesce" from "coalesce on key 0".
+    template<typename TEvent>
+    void post_coalesce(uint64_t key, TEvent event) {
+        EventTypeId tid = _typeIdOf<TEvent>();
+        EventPriority prio = EventPriority::Normal;
+        if constexpr (requires { TEvent::kPriority; }) {
+            prio = TEvent::kPriority;
+        }
+        std::vector<uint8_t> bytes(sizeof(TEvent));
+        std::memcpy(bytes.data(), &event, sizeof(TEvent));
+        _post(tid, prio, key, /*hasCoalesceKey=*/true, std::move(bytes));
+        (void)event;
     }
 
     // ----- Pump (main thread only, design §2.2) ------------------------------
@@ -112,6 +131,20 @@ public:
     size_t pendingCount() const;
     bool isMainThread() const;
 
+    // Phase 2 §8 counters (atomic; safe to read from any thread).
+    uint64_t totalPosted()    const { return _totalPosted.load(std::memory_order_relaxed); }
+    uint64_t totalCoalesced() const { return _totalCoalesced.load(std::memory_order_relaxed); }
+    uint64_t totalDelivered() const { return _totalDelivered.load(std::memory_order_relaxed); }
+    uint64_t peakQueueDepth() const { return _peakQueueDepth.load(std::memory_order_relaxed); }
+
+    // Reset all counters to zero. Useful for tests / per-frame diagnostics.
+    void resetCounters() {
+        _totalPosted.store(0,    std::memory_order_relaxed);
+        _totalCoalesced.store(0, std::memory_order_relaxed);
+        _totalDelivered.store(0, std::memory_order_relaxed);
+        _peakQueueDepth.store(0, std::memory_order_relaxed);
+    }
+
     // Internal accessors used by ScopedConnection. Not public API.
     void _unsubscribeRaw(ConnectionId id);
 
@@ -121,7 +154,9 @@ private:
     };
 
     void _emit(EventTypeId tid, const void* payload);
-    void _post(EventTypeId tid, EventPriority prio, std::vector<uint8_t> bytes);
+    void _post(EventTypeId tid, EventPriority prio, uint64_t coalesceKey,
+               bool hasCoalesceKey, std::vector<uint8_t> bytes);
+    void _updatePeakDepth();
 
     template<typename TEvent>
     EventTypeId _typeIdOf() {
@@ -185,6 +220,12 @@ private:
 
     // Counter for runtime-assigned type ids (above kHandAssignedTypeIdMax).
     std::atomic<uint32_t> _nextRuntimeTypeId{kHandAssignedTypeIdMax + 1};
+
+    // Phase 2 counters (atomic; design §8).
+    std::atomic<uint64_t> _totalPosted{0};
+    std::atomic<uint64_t> _totalCoalesced{0};
+    std::atomic<uint64_t> _totalDelivered{0};
+    std::atomic<uint64_t> _peakQueueDepth{0};
 
     friend class ScopedConnection;
 };
