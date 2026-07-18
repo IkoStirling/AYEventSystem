@@ -640,3 +640,185 @@ TEST_CASE(ResetCounters) {
 }
 
 TEST_SUITE_END
+
+// -----------------------------------------------------------------------------
+// Phase 3 §8 — string aliases (Script INT-04 bridge) + unsubscribeAll
+// -----------------------------------------------------------------------------
+TEST_SUITE(EventBus_Bridges)
+
+struct AliasedEvent {
+    int payload = 0;
+    static constexpr EventTypeId   kTypeId   = 0x0A00'0100;
+    static constexpr EventPriority kPriority = EventPriority::Normal;
+};
+
+TEST_CASE(RegisterAndLookupAlias) {
+    EventBus bus;
+    bus.registerAlias<AliasedEvent>("aliased_event");
+    EventTypeId tid = bus.aliasToTypeId("aliased_event");
+    CHECK_TRUE(tid != 0);
+    CHECK_INT_EQ(static_cast<int>(tid), 0x0A00'0100);
+}
+
+TEST_CASE(UnknownAliasReturnsZero) {
+    EventBus bus;
+    CHECK_INT_EQ(static_cast<int>(bus.aliasToTypeId("never_registered")), 0);
+}
+
+TEST_CASE(SubscribeByAliasDelivers) {
+    EventBus bus;
+    int got = 0;
+    bus.subscribeByAlias<AliasedEvent>("aliased_event",
+        [&](const AliasedEvent& e) { got = e.payload; });
+    bus.emitByAlias<AliasedEvent>("aliased_event", AliasedEvent{99});
+    CHECK_INT_EQ(got, 99);
+}
+
+TEST_CASE(PostByAliasDeliversOnPump) {
+    EventBus bus;
+    int got = 0;
+    bus.subscribeByAlias<AliasedEvent>("aliased_event",
+        [&](const AliasedEvent& e) { got = e.payload; });
+    bool ok = bus.postByAlias<AliasedEvent>("aliased_event", AliasedEvent{42});
+    CHECK_TRUE(ok);
+    bus.pump();
+    CHECK_INT_EQ(got, 42);
+}
+
+TEST_CASE(EmitByAliasUnknownReturnsFalse) {
+    EventBus bus;
+    bool ok = bus.emitByAlias<AliasedEvent>("never_registered", AliasedEvent{1});
+    CHECK_FALSE(ok);
+}
+
+TEST_CASE(UnsubscribeAllDropsEveryListener) {
+    EventBus bus;
+    int a = 0, b = 0, c = 0;
+    bus.subscribe<SimpleEvent>([&](const SimpleEvent&) { ++a; });
+    bus.subscribe<SimpleEvent>([&](const SimpleEvent&) { ++b; });
+    bus.subscribe<OtherEvent>([&](const OtherEvent&) { ++c; });
+    bus.emit(SimpleEvent{0});
+    bus.emit(OtherEvent{"x", {}});
+    CHECK_INT_EQ(a, 1);
+    CHECK_INT_EQ(b, 1);
+    CHECK_INT_EQ(c, 1);
+
+    bus.unsubscribeAll();
+
+    bus.emit(SimpleEvent{0});
+    bus.emit(OtherEvent{"y", {}});
+    CHECK_INT_EQ(a, 1); // unchanged
+    CHECK_INT_EQ(b, 1);
+    CHECK_INT_EQ(c, 1);
+}
+
+TEST_CASE(UnsubscribeAllClearsPendingAdds) {
+    // Simulate "subscribe during emit" then unsubscribeAll mid-delivery. The
+    // pending add must be cleared so the listener does not appear later.
+    EventBus bus;
+    int delivered = 0;
+    bus.subscribe<SimpleEvent>([&](const SimpleEvent&) {
+        bus.subscribe<SimpleEvent>([&](const SimpleEvent&) { ++delivered; });
+    });
+    bus.unsubscribeAll();
+    bus.emit(SimpleEvent{0});
+    CHECK_INT_EQ(delivered, 0);
+}
+
+TEST_SUITE_END
+
+// -----------------------------------------------------------------------------
+// Phase 3 §8 — host integration examples (Device / Resource / AYTask patterns)
+// -----------------------------------------------------------------------------
+// These tests simulate the wiring described in docs/host_examples.md. They
+// exercise the bus's role as a deferred delivery channel between worker
+// threads and the main game thread; the actual Device / Resource / AYTask
+// modules are separate repos and link against AYEventSystem for the real
+// integration. Here we verify the bus's contract that downstream callers
+// rely on.
+
+TEST_SUITE(EventBus_HostExamples)
+
+// Pattern A: AYDevice discrete action → main → post → pump → listener.
+struct DeviceActionEvent {
+    int actionId = 0;
+    bool pressed = false;
+    static constexpr EventTypeId   kTypeId   = 0x0A00'0200;
+    static constexpr EventPriority kPriority = EventPriority::High;
+};
+TEST_CASE(DeviceActionPattern) {
+    EventBus bus;
+    std::atomic<int> received{0};
+    int lastAction = 0;
+    bool lastPressed = false;
+    bus.subscribe<DeviceActionEvent>([&](const DeviceActionEvent& e) {
+        received.fetch_add(1);
+        lastAction = e.actionId;
+        lastPressed = e.pressed;
+    });
+    // Simulate Device thread posting a discrete button edge.
+    std::thread dev([&] {
+        bus.post(DeviceActionEvent{42, true});
+        bus.post(DeviceActionEvent{42, false});
+    });
+    dev.join();
+    bus.pump();
+    CHECK_INT_EQ(received.load(), 2);
+    CHECK_INT_EQ(lastAction, 42);
+    CHECK_FALSE(lastPressed); // last write wins
+}
+
+// Pattern B: AYResource worker → post complete → main pump notifies dependents.
+struct ResourceLoadCompleteEvent {
+    uint64_t handle = 0;
+    int      refCount = 0;
+    static constexpr EventTypeId   kTypeId   = 0x0A00'0201;
+    static constexpr EventPriority kPriority = EventPriority::Low;
+};
+TEST_CASE(ResourceWorkerPattern) {
+    EventBus bus;
+    std::atomic<int> dependentsNotified{0};
+    bus.subscribe<ResourceLoadCompleteEvent>(
+        [&](const ResourceLoadCompleteEvent&) { dependentsNotified.fetch_add(1); });
+
+    // Simulate 3 workers loading 3 different resources concurrently.
+    constexpr int kWorkers = 3;
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kWorkers; ++i) {
+        ts.emplace_back([&, i] {
+            bus.post(ResourceLoadCompleteEvent{static_cast<uint64_t>(i), 1});
+        });
+    }
+    for (auto& t : ts) t.join();
+    bus.pump();
+    CHECK_INT_EQ(dependentsNotified.load(), kWorkers);
+}
+
+// Pattern C: AYTask completion callback → post → main pump.
+struct TaskCompleteEvent {
+    uint64_t taskId = 0;
+    bool     ok = false;
+    static constexpr EventTypeId   kTypeId   = 0x0A00'0202;
+    static constexpr EventPriority kPriority = EventPriority::Normal;
+};
+TEST_CASE(TaskCompletionPattern) {
+    EventBus bus;
+    std::atomic<int> okCount{0};
+    bus.subscribe<TaskCompleteEvent>([&](const TaskCompleteEvent& e) {
+        if (e.ok) okCount.fetch_add(1);
+    });
+
+    // Simulate a job system firing completions from worker threads.
+    constexpr int kTasks = 50;
+    std::thread worker([&] {
+        for (int i = 0; i < kTasks; ++i) {
+            bus.post(TaskCompleteEvent{static_cast<uint64_t>(i), i % 2 == 0});
+        }
+    });
+    worker.join();
+    bus.pump();
+    // half succeeded
+    CHECK_INT_EQ(okCount.load(), kTasks / 2);
+}
+
+TEST_SUITE_END

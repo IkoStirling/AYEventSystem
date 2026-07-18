@@ -128,6 +128,31 @@ void EventBus::_unsubscribeRaw(ConnectionId id) {
 }
 
 // -----------------------------------------------------------------------------
+// Phase 3: unsubscribeAll — drop every listener. Call only when no emit/pump
+// is in flight (e.g. shutdown).
+// -----------------------------------------------------------------------------
+void EventBus::unsubscribeAll() {
+    std::lock_guard<std::mutex> blk(_bucketsMutex);
+    std::lock_guard<std::mutex> mlk(_mutationMutex);
+    for (auto& kv : _buckets) {
+        kv.second->listeners.clear();
+    }
+    _pendingAdds.clear();
+    _pendingRemoves.clear();
+    _deliveryDepth = 0;
+}
+
+// -----------------------------------------------------------------------------
+// Phase 3: alias → EventTypeId lookup.
+// -----------------------------------------------------------------------------
+EventTypeId EventBus::aliasToTypeId(std::string_view alias) const {
+    std::lock_guard<std::mutex> lk(_aliasMutex);
+    auto it = _aliases.find(std::string(alias));
+    if (it == _aliases.end()) return 0;
+    return it->second;
+}
+
+// -----------------------------------------------------------------------------
 // Synchronous emit
 // -----------------------------------------------------------------------------
 void EventBus::_emit(EventTypeId tid, const void* payload) {
@@ -234,7 +259,8 @@ void EventBus::_post(EventTypeId tid, EventPriority prio, uint64_t coalesceKey,
     // Fresh post path.
     std::vector<uint8_t> packet(kHeaderSize + bytes.size());
     PostEnvelope env{ tid, static_cast<uint32_t>(bytes.size()),
-                      coalesceKey, hasCoalesceKey ? 1 : 0, {0,0,0,0,0,0,0} };
+                      coalesceKey, static_cast<uint8_t>(hasCoalesceKey ? 1 : 0),
+                      {0,0,0,0,0,0,0} };
     std::memcpy(packet.data(), &env, kHeaderSize);
     if (!bytes.empty()) {
         std::memcpy(packet.data() + kHeaderSize, bytes.data(), bytes.size());

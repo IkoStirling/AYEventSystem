@@ -20,6 +20,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <typeindex>
 #include <typeinfo>
@@ -82,6 +84,11 @@ public:
     // Remove a listener by its opaque id. Idempotent; safe during delivery.
     void unsubscribe(ConnectionId id);
 
+    // Phase 3 §8: drop every listener across every type on this bus instance.
+    // Intended for shutdown (e.g. GameLoop end-of-session). Safe to call from
+    // main thread only; do NOT call while a pump or emit is in flight.
+    void unsubscribeAll();
+
     // ----- Synchronous emit (main thread only, design §2.2) -------------------
     template<typename TEvent>
     void emit(const TEvent& event) {
@@ -143,6 +150,56 @@ public:
         _totalCoalesced.store(0, std::memory_order_relaxed);
         _totalDelivered.store(0, std::memory_order_relaxed);
         _peakQueueDepth.store(0, std::memory_order_relaxed);
+    }
+
+    // ----- Phase 3 §8: string aliases for Script INT-04 ------------------------
+    // Map a stable string name to an EventTypeId. After registering, callers
+    // can dispatch by string via emitByAlias / postByAlias — useful for script
+    // bindings where the EventTypeId is not known at compile time.
+    //
+    // Notes:
+    //   - String keys live on the bus instance (NOT process-static) to honour
+    //     the design §3.6 "no static listener vector" rule.
+    //   - registerAlias is main-thread preferred; off-main needs external sync.
+    //   - Type T must be the SAME type that was used to compute tid; we re-use
+    //     _typeIdOf<T> so the mapping is consistent with typed dispatch.
+    template<typename TEvent>
+    void registerAlias(std::string_view alias) {
+        EventTypeId tid = _typeIdOf<TEvent>();
+        std::lock_guard<std::mutex> lk(_aliasMutex);
+        _aliases.emplace(std::string(alias), tid);
+    }
+
+    // Look up the EventTypeId for an alias. Returns 0 if unknown.
+    EventTypeId aliasToTypeId(std::string_view alias) const;
+
+    // Subscribe / emit / post by alias. Useful for script bindings (INT-04)
+    // and any caller that holds only the string name.
+    template<typename TEvent>
+    ConnectionId subscribeByAlias(std::string_view alias,
+                                  std::function<void(const TEvent&)> handler) {
+        ConnectionId id = subscribe<TEvent>(std::move(handler));
+        // Make sure the alias is registered (idempotent).
+        registerAlias<TEvent>(alias);
+        return id;
+    }
+
+    template<typename TEvent>
+    bool emitByAlias(std::string_view alias, const TEvent& event) {
+        EventTypeId tid = aliasToTypeId(alias);
+        if (tid == 0) return false;
+        emit<TEvent>(event);
+        (void)tid;
+        return true;
+    }
+
+    template<typename TEvent>
+    bool postByAlias(std::string_view alias, TEvent event) {
+        EventTypeId tid = aliasToTypeId(alias);
+        if (tid == 0) return false;
+        post<TEvent>(std::move(event));
+        (void)tid;
+        return true;
     }
 
     // Internal accessors used by ScopedConnection. Not public API.
@@ -226,6 +283,11 @@ private:
     std::atomic<uint64_t> _totalCoalesced{0};
     std::atomic<uint64_t> _totalDelivered{0};
     std::atomic<uint64_t> _peakQueueDepth{0};
+
+    // Phase 3: alias map (string → EventTypeId). Separate mutex so string
+    // lookups don't contend with listener-bucket / post-queue locks.
+    mutable std::mutex _aliasMutex;
+    std::unordered_map<std::string, EventTypeId> _aliases;
 
     friend class ScopedConnection;
 };
