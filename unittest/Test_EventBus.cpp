@@ -725,6 +725,69 @@ TEST_CASE(UnsubscribeAllClearsPendingAdds) {
     CHECK_INT_EQ(delivered, 0);
 }
 
+TEST_CASE(RepeatedUnsubscribeAllAfterEmptyEmits) {
+    // Regression: AYGameLoop facade migration exposed a corner where
+    //   subscribe → unsubscribeAll → emit (empty) → emit (empty) → unsubscribeAll
+    // would crash inside the third unsubscribeAll. Cause traced to stale
+    // for-loop over _buckets after multiple emit→flush cycles.
+    EventBus bus;
+    int called = 0;
+    bus.subscribe<SimpleEvent>([&](const SimpleEvent&) { ++called; });
+    bus.unsubscribeAll();
+    bus.emit(SimpleEvent{1});  // empty bucket — flushes with depth returning to 0
+    bus.emit(SimpleEvent{2});  // ditto
+    bus.unsubscribeAll();      // <-- was crashing
+    bus.emit(SimpleEvent{3});
+    CHECK_INT_EQ(called, 0);
+}
+
+TEST_CASE(MultipleBucketsUnsubscribeAllAfterEmptyEmits) {
+    // Regression closer to AYGameLoop GameLoopEventBus.Clear pattern:
+    //   1) subscribe type A (some listeners)
+    //   2) subscribe type B (other listeners)  -- like MultipleSubscribers
+    //   3) emit type A and type B
+    //   4) subscribe type A again
+    //   5) unsubscribeAll
+    //   6) emit type A (empty), emit type A (empty), unsubscribeAll
+    // The dangling-capture pattern from MultipleSubscribers is what triggers
+    // the actual crash in the AYGameLoop integration.
+    EventBus bus;
+    int countA = 0, countB = 0;
+    bus.subscribe<SimpleEvent>([&](const SimpleEvent&) { ++countA; });
+    bus.subscribe<OtherEvent>([&](const OtherEvent&) { ++countB; });
+    bus.emit(SimpleEvent{1});
+    bus.emit(OtherEvent{"x", {}});
+    CHECK_INT_EQ(countA, 1);
+    CHECK_INT_EQ(countB, 1);
+
+    int calledAgain = 0;
+    bus.subscribe<SimpleEvent>([&](const SimpleEvent&) { ++calledAgain; });
+    bus.unsubscribeAll();
+
+    bus.emit(SimpleEvent{2});  // empty, flushes
+    bus.emit(SimpleEvent{3});  // empty, flushes
+    bus.unsubscribeAll();      // <-- crashes in AYGameLoop integration
+    bus.emit(SimpleEvent{4});
+
+    CHECK_INT_EQ(countA, 1);
+    CHECK_INT_EQ(countB, 1);
+    CHECK_INT_EQ(calledAgain, 0);
+}
+
+TEST_CASE(LocalBusSubscribeEmitDestroy) {
+    // Pattern matches AYGameLoop's GameLoopEventBus.Clear test:
+    //   - local EventBus
+    //   - subscribe + unsubscribeAll + emit (empty)
+    //   - then test function returns (bus destroyed)
+    EventBus bus;
+    int called = 0;
+    bus.subscribe<SimpleEvent>([&](const SimpleEvent&) { ++called; });
+    bus.unsubscribeAll();
+    bus.emit(SimpleEvent{1});
+    CHECK_INT_EQ(called, 0);
+    // bus destroyed on scope exit
+}
+
 TEST_SUITE_END
 
 // -----------------------------------------------------------------------------
