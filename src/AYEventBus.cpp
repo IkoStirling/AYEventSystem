@@ -53,10 +53,12 @@ bool EventBus::isMainThread() const {
 EventBus::ListenerBucket& EventBus::_bucketFor(EventTypeId tid) {
     auto it = _buckets.find(tid);
     if (it == _buckets.end()) {
-        auto bucket = std::make_unique<ListenerBucket>();
-        auto& ref = *bucket;
-        _buckets.emplace(tid, std::move(bucket));
-        return ref;
+        // Insert first (default-constructed unique_ptr) then init the bucket
+        // in place. Two-step avoids the "ref to be-moved" pitfall where the
+        // returned reference might dangle if emplace triggers a rehash.
+        auto [insertedIt, _] = _buckets.emplace(tid, nullptr);
+        insertedIt->second = std::make_unique<ListenerBucket>();
+        return *insertedIt->second;
     }
     return *it->second;
 }
@@ -135,7 +137,12 @@ void EventBus::unsubscribeAll() {
     std::lock_guard<std::mutex> blk(_bucketsMutex);
     std::lock_guard<std::mutex> mlk(_mutationMutex);
     for (auto& kv : _buckets) {
-        kv.second->listeners.clear();
+        // Defensive: kv.second is unique_ptr; skip if somehow null. Should
+        // never be null after _bucketFor's two-step insert, but guard anyway
+        // against any future caller manually manipulating the map.
+        if (kv.second) {
+            kv.second->listeners.clear();
+        }
     }
     _pendingAdds.clear();
     _pendingRemoves.clear();
