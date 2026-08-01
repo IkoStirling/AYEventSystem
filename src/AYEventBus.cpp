@@ -68,6 +68,17 @@ EventBus::ListenerBucket& EventBus::_bucketFor(EventTypeId tid) {
 // -----------------------------------------------------------------------------
 ConnectionId EventBus::subscribeById(EventTypeId tid,
                                      std::function<void(const void*)> erased) {
+#ifndef NDEBUG
+    // §2.2 contract: subscribe is main-thread only. Off-main would race
+    // with emit/pump iterating the listener vector. Main-thread capture
+    // may not have happened yet if this is the first bus op; treat that
+    // case as "trust the caller" and let the first emit/pump install the
+    // canonical main-thread id.
+    if (_mainThreadCaptured.load(std::memory_order_acquire)) {
+        assert(isMainThread()
+               && "EventBus::subscribeById called off main thread (forbidden by §2.2)");
+    }
+#endif
     ConnectionId id = _nextConnectionId.fetch_add(1, std::memory_order_relaxed);
     auto entry = std::make_unique<ListenerEntry>();
     entry->id = id;
@@ -89,6 +100,14 @@ ConnectionId EventBus::subscribeById(EventTypeId tid,
 // -----------------------------------------------------------------------------
 void EventBus::unsubscribe(ConnectionId id) {
     if (id == kInvalidConnectionId) return;
+#ifndef NDEBUG
+    // §2.2 contract: unsubscribe is main-thread only. Off-main would race
+    // with the snapshot a concurrent emit grabbed for raw-ptr delivery.
+    if (_mainThreadCaptured.load(std::memory_order_acquire)) {
+        assert(isMainThread()
+               && "EventBus::unsubscribe called off main thread (forbidden by §2.2)");
+    }
+#endif
 
     bool inDelivery = false;
     {
@@ -134,6 +153,18 @@ void EventBus::_unsubscribeRaw(ConnectionId id) {
 // is in flight (e.g. shutdown).
 // -----------------------------------------------------------------------------
 void EventBus::unsubscribeAll() {
+#ifndef NDEBUG
+    // Contract: caller must ensure no emit/pump is currently iterating.
+    // Forcibly clobbering _deliveryDepth to 0 mid-flight would orphan
+    // pending adds/removes and silently break reentrancy safety.
+    assert(_deliveryDepth == 0
+           && "EventBus::unsubscribeAll called while delivery in flight "
+              "(would orphan pending adds/removes)");
+    if (_mainThreadCaptured.load(std::memory_order_acquire)) {
+        assert(isMainThread()
+               && "EventBus::unsubscribeAll called off main thread (forbidden by §2.2)");
+    }
+#endif
     std::lock_guard<std::mutex> blk(_bucketsMutex);
     std::lock_guard<std::mutex> mlk(_mutationMutex);
     for (auto& kv : _buckets) {
@@ -173,7 +204,14 @@ void EventBus::_emit(EventTypeId tid, const void* payload) {
            && "EventBus::emit called off main thread");
 #endif
 
-    // Snapshot listeners under lock; release lock before invoking.
+    // Snapshot listeners under lock AND bump _deliveryDepth within the same
+    // critical section. This closes the F2 window where a worker thread
+    // could observe depth==0, grab _bucketsMutex, erase a listener, and free
+    // the ListenerEntry while the emit-side snapshot still holds a raw ptr
+    // to it. With depth bumped under the lock, concurrent unsubscribe(from
+    // another thread) — though forbidden by §2.2 — would always enter the
+    // pending-removes path when it saw depth>0, leaving the entry alive
+    // until _flushPendingMutations fires after delivery.
     std::vector<ListenerEntry*> snapshot;
     {
         std::lock_guard<std::mutex> lk(_bucketsMutex);
@@ -181,22 +219,27 @@ void EventBus::_emit(EventTypeId tid, const void* payload) {
         if (it == _buckets.end()) return;
         snapshot.reserve(it->second->listeners.size());
         for (auto& e : it->second->listeners) snapshot.push_back(e.get());
+        _deliveryDepth++;
     }
 
-    _deliveryDepth++;
     // Invoke in registration order. Per design §3.5, nested post/emit is
     // allowed; mutations made by handlers are deferred until deliveryDepth
     // returns to zero.
     for (auto* e : snapshot) {
-        // A handler may have been unsubscribed concurrently in a multi-thread
-        // scenario via pending-removes that flushed; the entry pointer is
-        // still valid here because _unsubscribeRaw would only erase entries
-        // outside delivery, and we hold the snapshot. (Pending removes are
-        // applied in _flushPendingMutations after delivery.)
+        // The entry pointer is alive for the duration of delivery because
+        // either (a) we're on the main thread — same thread as emit/pump,
+        // so no other thread can race unsubscribe, and same-thread unsub
+        // routes through pending-removes (depth>0 here), or (b) we're
+        // contract-violated and another thread called unsubscribe — even
+        // then, depth>0 makes _unsubscribeRaw defer to pending-removes,
+        // so the entry survives until _flushPendingMutations runs below.
         e->invoke(payload);
     }
     _totalDelivered.fetch_add(1, std::memory_order_relaxed);
-    _deliveryDepth--;
+    {
+        std::lock_guard<std::mutex> lk(_bucketsMutex);
+        _deliveryDepth--;
+    }
     if (_deliveryDepth == 0) _flushPendingMutations();
 }
 
@@ -232,6 +275,13 @@ void EventBus::_updatePeakDepth() {
 void EventBus::_post(EventTypeId tid, EventPriority prio, uint64_t coalesceKey,
                      bool hasCoalesceKey, std::vector<uint8_t> bytes) {
     size_t idx = static_cast<size_t>(prio);
+#ifndef NDEBUG
+    // Defensive: a stray EventPriority cast from int or post-load enum drift
+    // would silently re-bucket into Normal and the user would never know.
+    assert(idx < _queues.size()
+           && "EventBus::_post received out-of-range EventPriority; expected one of "
+              "Critical/High/Normal/Low (Count=4). Will fall back to Normal in release.");
+#endif
     if (idx >= _queues.size()) idx = static_cast<size_t>(EventPriority::Normal);
 
     std::lock_guard<std::mutex> lk(_postMutex);
@@ -338,7 +388,13 @@ void EventBus::_flushPendingMutations() {
         auto& bucket = _bucketFor(add.tid);
         bucket.listeners.push_back(std::move(add.entry));
     }
-    _pendingAdds.clear();
+    // Drop dead pending-adds (those canceled mid-delivery by _unsubscribeRaw)
+    // so the backlog shrinks back to zero instead of accruing forever under
+    // subscribe/unsubscribe-during-emit hot loops.
+    _pendingAdds.erase(
+        std::remove_if(_pendingAdds.begin(), _pendingAdds.end(),
+                       [](const PendingAdd& a) { return !a.entry; }),
+        _pendingAdds.end());
 
     // Pending removes: tid==0 means "search all buckets" (we don't track
     // owning type for unsubscribes that happened during delivery).

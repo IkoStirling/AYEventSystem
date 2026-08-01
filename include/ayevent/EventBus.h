@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
@@ -99,6 +100,16 @@ public:
     // ----- Deferred post (any thread, design §2.2) ----------------------------
     template<typename TEvent>
     void post(TEvent event) {
+        // Enforced payload contract (design §3.2 + §12.1): the queued payload
+        // is byte-copied into the vector and never destructed, so non-trivial
+        // types (std::string, std::vector, anything with a dtor) would leak
+        // resources and leave dangling heap pointers. Use emit() for those,
+        // or carry id / fixed buffer / trivially-copyable fields instead.
+        static_assert(std::is_trivially_copyable_v<TEvent>,
+            "EventBus::post<TEvent>: TEvent must be trivially_copyable. "
+            "Non-trivial payloads (std::string, std::vector, owning types) "
+            "must be delivered via emit() (main-thread sync) or carry an id / "
+            "fixed buffer in the event payload instead.");
         EventTypeId tid = _typeIdOf<TEvent>();
         EventPriority prio = EventPriority::Normal;
         if constexpr (requires { TEvent::kPriority; }) {
@@ -119,6 +130,12 @@ public:
     // flag to distinguish "no coalesce" from "coalesce on key 0".
     template<typename TEvent>
     void post_coalesce(uint64_t key, TEvent event) {
+        // Same payload contract as post(): trivially_copyable, or the queued
+        // payload (and any heap it owns) will silently leak / dangle.
+        static_assert(std::is_trivially_copyable_v<TEvent>,
+            "EventBus::post_coalesce<TEvent>: TEvent must be trivially_copyable. "
+            "Non-trivial payloads must be delivered via emit() or carry "
+            "id / fixed buffer in the event payload instead.");
         EventTypeId tid = _typeIdOf<TEvent>();
         EventPriority prio = EventPriority::Normal;
         if constexpr (requires { TEvent::kPriority; }) {
