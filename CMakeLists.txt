@@ -2,7 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 
 # AYEventSystem — engine-wide typed event bus
 # See design.md for the full spec.
-project(AYEventSystem)
+project(AYEventSystem
+    VERSION 0.1.0
+    DESCRIPTION "AYEventSystem — typed engine-wide event bus + facade migration"
+)
 
 set(MODULE_NAME AYEventSystem)
 
@@ -35,3 +38,5 @@ target_compile_options(${MODULE_NAME} PRIVATE
 
 enable_testing()
 add_subdirectory(unittest)
+
+message(STATUS "AYEventSystem v0.1.0 (typed event bus + GameLoopEventBus facade migration) — see ${CMAKE_CURRENT_SOURCE_DIR}/design.md")
