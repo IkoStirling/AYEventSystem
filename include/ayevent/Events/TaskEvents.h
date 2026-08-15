@@ -2,7 +2,7 @@
 // TaskEvents.h — shared POD events (task range 0x0007'xxxx)
 //
 // Posted by Application's Task→EventBus completion hook (AYTask stays
-// EventSystem-free; see aytask/TaskCompletionHook.h).
+// EventSystem-free; see AYTask/TaskCompletionHook.h).
 
 #include <ayevent/EventPriority.h>
 
