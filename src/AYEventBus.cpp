@@ -2,7 +2,7 @@
 //
 // Implementation per design.md §3-§4 (Phase 1).
 
-#include <ayevent/EventBus.h>
+#include <AYEventSystem/EventBus.h>
 
 #include <algorithm>
 #include <cassert>

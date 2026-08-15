@@ -11,8 +11,8 @@
 //
 // See design.md §3 for the full spec; this is the Phase 1 surface.
 
-#include <ayevent/EventPriority.h>
-#include <ayevent/Connection.h>
+#include <AYEventSystem/EventPriority.h>
+#include <AYEventSystem/Connection.h>
 
 #include <atomic>
 #include <cstdint>

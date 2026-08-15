@@ -3,8 +3,8 @@
 // Covers design §9 test matrix. Uses AYTest (per project rule §2).
 // Uses local EventBus instances (not singleton) for isolation.
 
-#include <ayevent/EventBus.h>
-#include <ayevent/Events/WindowEvents.h>
+#include <AYEventSystem/EventBus.h>
+#include <AYEventSystem/Events/WindowEvents.h>
 #include <AYTest.h>
 
 #include <atomic>
@@ -935,7 +935,7 @@ namespace post_contract {
 
 TEST_CASE(PostRejectsNonTrivialAtCompileTime) {
     // Documentation test (no runtime check). The contract is enforced by
-    // EventBus.h's static_assert; if a future change weakens it, the
+    // AYEventSystem/EventBus.h's static_assert; if a future change weakens it, the
     // static_asserts in the anonymous namespace above will fail.
     CHECK_TRUE(true);
 }

@@ -14,16 +14,17 @@ set(SOURCES
 )
 
 set(HEADERS
-    include/ayevent/EventPriority.h
-    include/ayevent/Connection.h
-    include/ayevent/EventBus.h
-    include/ayevent/Events/WindowEvents.h
-    include/ayevent/Events/SceneEvents.h
-    include/ayevent/Events/DeviceEvents.h
-    include/ayevent/Events/ResourceEvents.h
-    include/ayevent/Events/PhysicsEvents.h
-    include/ayevent/Events/ScriptTestEvents.h
-    include/ayevent/Events/TaskEvents.h
+    AYEventSystem.h
+    include/AYEventSystem/EventPriority.h
+    include/AYEventSystem/Connection.h
+    include/AYEventSystem/EventBus.h
+    include/AYEventSystem/Events/WindowEvents.h
+    include/AYEventSystem/Events/SceneEvents.h
+    include/AYEventSystem/Events/DeviceEvents.h
+    include/AYEventSystem/Events/ResourceEvents.h
+    include/AYEventSystem/Events/PhysicsEvents.h
+    include/AYEventSystem/Events/ScriptTestEvents.h
+    include/AYEventSystem/Events/TaskEvents.h
 )
 
 add_library(${MODULE_NAME} STATIC ${SOURCES} ${HEADERS})

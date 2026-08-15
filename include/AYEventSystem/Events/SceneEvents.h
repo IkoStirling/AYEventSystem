@@ -1,11 +1,11 @@
 #pragma once
-// SceneEvents.h — Scene lifecycle notifications (module range 0x0002'xxxx)
+// AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/SceneEvents.h — Scene lifecycle notifications (module range 0x0002'xxxx)
 //
 // Emitted by AYApplication's SceneLifecycleEventBridge when SceneManager
 // reports beginPlay / endPlay / setCurrent. Subscribe via host->eventBus()
 // (or EventBus::instance() outside Host scope).
 
-#include <ayevent/EventPriority.h>
+#include <AYEventSystem/EventPriority.h>
 
 namespace ayt::scene
 {

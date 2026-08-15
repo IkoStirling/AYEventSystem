@@ -1,12 +1,12 @@
 #pragma once
-// DeviceEvents.h — shared POD events (device range 0x0003'xxxx)
+// AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/DeviceEvents.h — shared POD events (device range 0x0003'xxxx)
 //
 // Produced by DeviceSubSystem:
 //   - DeviceActionEvent on InputMapping just-pressed / just-released
 //     (actionId = FNV-1a of action name). Continuous axes stay off-bus.
-// Window resize/close use WindowEvents.h (also posted by DeviceSubSystem).
+// Window resize/close use AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/WindowEvents.h (also posted by DeviceSubSystem).
 
-#include <ayevent/EventPriority.h>
+#include <AYEventSystem/EventPriority.h>
 
 #include <cstdint>
 

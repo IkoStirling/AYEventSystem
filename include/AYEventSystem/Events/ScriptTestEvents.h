@@ -1,7 +1,7 @@
 #pragma once
-// ScriptTestEvents.h — INT-04 test / script ping (script range 0x0006'xxxx)
+// AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/ScriptTestEvents.h — INT-04 test / script ping (script range 0x0006'xxxx)
 
-#include <ayevent/EventPriority.h>
+#include <AYEventSystem/EventPriority.h>
 
 #include <cstdint>
 

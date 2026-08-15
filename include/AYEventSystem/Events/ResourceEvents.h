@@ -1,12 +1,12 @@
 #pragma once
-// ResourceEvents.h — shared POD events (resource range 0x0004'xxxx)
+// AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/ResourceEvents.h — shared POD events (resource range 0x0004'xxxx)
 //
 // Produced by AsyncLoader on worker completion (post → main pump):
 //   - ResourceLoadCompleteEvent (ok=true on success; ok=false terminal miss)
 //   - ResourceLoadFailedEvent (errorCode 1=cancelled, 2=load failed)
 // handle = hash(path). INT-04 alias "resource_ready" maps Complete.
 
-#include <ayevent/EventPriority.h>
+#include <AYEventSystem/EventPriority.h>
 
 #include <cstdint>
 

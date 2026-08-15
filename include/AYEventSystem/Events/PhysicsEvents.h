@@ -1,11 +1,11 @@
 #pragma once
-// PhysicsEvents.h — shared POD events (physics range 0x0005'xxxx)
+// AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/PhysicsEvents.h — shared POD events (physics range 0x0005'xxxx)
 //
 // Produced by AYPhysics PhysicsEventBridge (E-3) after fetchResults on the
 // game thread (PhysicsSubSystem::fixedUpdate). Contact points / impulses
 // stay solver-domain only — bus carries body handles + kind.
 
-#include <ayevent/EventPriority.h>
+#include <AYEventSystem/EventPriority.h>
 
 #include <cstdint>
 

@@ -14,7 +14,7 @@ notifications. Spec: [`design.md`](design.md). Host patterns:
 | **AYApplication** (`bindBuiltinHostServices`) | `TaskCompleteEvent` | Via AYTask completion hook | AYTask itself does **not** link EventSystem |
 | **AYApplication** (`SceneLifecycleEventBridge`) | `SceneCurrentChangedEvent`, `SceneBeginPlayEvent`, `SceneEndPlayEvent` | SceneManager lifecycle | AYScene stays EventSystem-free |
 | **AYPhysics** (`PhysicsEventBridge` / E-3) | `PhysicsCollisionEvent` | After `fetchResults` in `fixedUpdate` | kind 0/1/2; Box2D sensor 3/4 → 0/2; invalid handles skipped |
-| **AYGameLoop** | Frame / `SimTickEvent` | Loop tick | See `AYGameLoopEvents.h` |
+| **AYGameLoop** | Frame / `SimTickEvent` | Loop tick | See `AYGameLoop/GameLoopEvents.h` |
 | **AYScript** (INT-04 / INT-04b) | Alias emit of catalog types | Logia `event.emit` / EventHandler `run()` | Does **not** route S4.1 `signal`/`emit` |
 
 ## Catalog only (not production-posted yet)
@@ -22,7 +22,7 @@ notifications. Spec: [`design.md`](design.md). Host patterns:
 | Header | Intent |
 |--------|--------|
 | `DeviceAxisEvent` | Explicitly **not** on the bus (continuous input) |
-| `ScriptTestEvents.h` | INT-04 unit tests |
+| `AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/ScriptTestEvents.h` | INT-04 unit tests |
 
 ## Logia string aliases (INT-04 / INT-04b)
 

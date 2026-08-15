@@ -1,11 +1,11 @@
 #pragma once
-// AYEventSystem/Events/WindowEvents.h
+// AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/WindowEvents.h
 //
 // Optional shared POD events (design §7 — Events/ subdir). Grow over time.
 // All events here use hand-assigned kTypeId per module range
 // (window: 0x0001'xxxx — see design §3.2).
 
-#include <ayevent/EventPriority.h>
+#include <AYEventSystem/EventPriority.h>
 
 namespace ayt::event
 {

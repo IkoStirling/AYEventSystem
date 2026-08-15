@@ -1,4 +1,4 @@
-﻿# AYEventSystem Design
+# AYEventSystem Design
 
 **Path**: `D:\Projects\AYRuntime\AYEventSystem\`  
 **Status**: Phase 1–3 core + production Device/Resource/Task→bus wiring shipped; INT-04 Script ambient shipped in AYScript; Physics collision bridge still pending  
@@ -304,7 +304,7 @@ flowchart LR
 
 ### 6.1 GameLoopEventBus — interim, replace with AYEventSystem
 
-[`AYGameLoop` `GameLoopEventBus`](../AYGameLoop/include/GameLoopEventBus.h) is **not** the long-term engine event hub.
+[`AYGameLoop` `GameLoopEventBus`](../AYGameLoop/include/GameLoopAYEventSystem/EventBus.h) is **not** the long-term engine event hub.
 
 | | |
 |--|--|
@@ -324,18 +324,18 @@ AYRuntime/AYEventSystem/
 ├── design.md                 # this document (source of truth)
 ├── CMakeLists.txt            # Phase 1+
 ├── include/
-│   └── ayevent/
-│       ├── EventBus.h
-│       ├── EventPriority.h
+│   └── AYEventSystem/
+│       ├── AYEventSystem/EventBus.h
+│       ├── AYEventSystem/EventPriority.h
 │       ├── Connection.h      # ConnectionId + ScopedConnection
 │       └── Events/           # shared POD catalog (grow over time)
-│           ├── WindowEvents.h
-│           ├── SceneEvents.h
-│           ├── DeviceEvents.h      # DeviceSubSystem posts DeviceActionEvent
-│           ├── ResourceEvents.h    # AsyncLoader posts Complete/Failed
-│           ├── PhysicsEvents.h     # catalog; E-3 collision bridge pending
-│           ├── ScriptTestEvents.h  # INT-04 test ping
-│           └── TaskEvents.h        # Host hook posts TaskCompleteEvent
+│           ├── AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/WindowEvents.h
+│           ├── AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/SceneEvents.h
+│           ├── AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/DeviceEvents.h      # DeviceSubSystem posts DeviceActionEvent
+│           ├── AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/ResourceEvents.h    # AsyncLoader posts Complete/Failed
+│           ├── AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/PhysicsEvents.h     # catalog; E-3 collision bridge pending
+│           ├── AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/ScriptTestEvents.h  # INT-04 test ping
+│           └── AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/TaskEvents.h        # Host hook posts TaskCompleteEvent
 └── unittest/
     └── Test_EventBus.cpp
 ```
