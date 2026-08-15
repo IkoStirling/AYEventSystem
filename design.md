@@ -1,7 +1,7 @@
-# AYEventSystem Design
+﻿# AYEventSystem Design
 
 **Path**: `D:\Projects\AYRuntime\AYEventSystem\`  
-**Status**: Design locked (industrial direction) — Phase 1 implementation pending  
+**Status**: Phase 1–3 core shipped (bus + coalesce + counters + aliases + unsubscribeAll); production Device/Resource/Task wiring still optional (host_examples only); INT-04 Script ambient shipped in AYScript  
 **Supersedes**: earlier feature-list draft in this file; rejects AliyatRenderer `Core/EventSystem` architecture
 
 ---
@@ -21,7 +21,7 @@
 
 - Absorbing `GameLoopEventBus` frame events.
 - Replacing AYUI internal `UIEvent` bubbling / EventBridge.
-- Logia global `event.emit` / `event.subscribe` (INT-04) — bridge later.
+- ~~Logia global `event.emit` / `event.subscribe` (INT-04)~~ — **shipped in AYScript** (ambient bridge; EventHandler host = INT-04b).
 - Per-layer thread pools or task-graph scheduling inside the bus.
 - Zero-heap-allocation SLA.
 - String-keyed core dispatch path.
@@ -295,7 +295,7 @@ flowchart LR
 | Module | Relationship |
 |--------|----------------|
 | **AYUI** | Keeps internal `UIEvent` + EventBridge. Host may `post` a few game-facing events (e.g. “pause menu requested”). High-frequency pointer streaming stays off the bus. |
-| **AYScript** | Per-component `signal` / `emit` / `connect` (S4.1) stay local. Global `event.*` (INT-04) bridges onto EventBus in a later phase. |
+| **AYScript** | Per-component `signal` / `emit` / `connect` (S4.1) stay local. Global `event.*` (INT-04) bridges onto EventBus via string aliases (**shipped** in AYScript; EventHandler host = INT-04b). |
 | **AYGameLoop** | See §6.1 — `GameLoopEventBus` is an **interim** typed sync bus; target is AYEventSystem. |
 | **AYDevice** | Prefer posting **discrete** actions / button edges; continuous axes/mouse deltas stay in the input → UI/game direct path. |
 | **AYResource** | Worker finish → `post(ResourceLoadCompleteEvent{...})` → main `pump` notifies dependents. |
@@ -328,8 +328,13 @@ AYRuntime/AYEventSystem/
 │       ├── EventBus.h
 │       ├── EventPriority.h
 │       ├── Connection.h      # ConnectionId + ScopedConnection
-│       └── Events/           # optional shared POD events (grow over time)
-│           └── WindowEvents.h
+│       └── Events/           # shared POD catalog (grow over time)
+│           ├── WindowEvents.h
+│           ├── SceneEvents.h
+│           ├── DeviceEvents.h      # catalog; production wiring deferred
+│           ├── ResourceEvents.h
+│           ├── PhysicsEvents.h
+│           └── ScriptTestEvents.h  # INT-04 test ping
 └── unittest/
     └── Test_EventBus.cpp
 ```
@@ -342,27 +347,27 @@ No `ECEventDependence` layer enum, no string `EventRegistry` in v1.
 
 ### Phase 1 — Core bus (first code drop)
 
-- [ ] `EventPriority`, `ConnectionId`, `ScopedConnection`
-- [ ] `EventBus` instance with per-type listener maps on the instance
-- [ ] `subscribe` / `unsubscribe` / `emit` / `post` / `pump`
-- [ ] Reentrancy-safe listener mutation
-- [ ] Debug main-thread asserts on `emit` / `pump`
-- [ ] AYTest coverage (see §8)
-- [ ] CMake target + wire into AYRuntime solution as needed
+- [x] `EventPriority`, `ConnectionId`, `ScopedConnection`
+- [x] `EventBus` instance with per-type listener maps on the instance
+- [x] `subscribe` / `unsubscribe` / `emit` / `post` / `pump`
+- [x] Reentrancy-safe listener mutation
+- [x] Debug main-thread asserts on `emit` / `pump`
+- [x] AYTest coverage (see §9)
+- [x] CMake target + wire into AYRuntime solution as needed
 
 **Out of Phase 1**: object pool, Script string bridge, GameLoop absorption, Device/UI production wiring, coalesce (optional stretch if cheap).
 
 ### Phase 2 — Queue hardening
 
-- [ ] `post_coalesce`
-- [ ] Optional event / packet pool (reduce alloc churn; still no “zero alloc” claim)
-- [ ] Basic counters (posted / delivered / peak queue depth) for diagnostics
+- [x] `post_coalesce`
+- [ ] Optional event / packet pool (reduce alloc churn; still no “zero alloc” claim) — deferred
+- [x] Basic counters (posted / delivered / peak queue depth) for diagnostics
 
 ### Phase 3 — Bridges
 
-- [ ] Optional string alias table for Script INT-04
-- [ ] Migrate `GameLoopEventBus` → AYEventSystem (facade or delete); update AYGameLoop call sites
-- [ ] Thin host examples (Device action → bus, Resource complete → bus, AYTask completion → `post`)
+- [x] Optional string alias table for Script INT-04 (`registerAlias` / `*ByAlias`; Script ambient ship in AYScript)
+- [x] Migrate `GameLoopEventBus` → AYEventSystem (facade)
+- [ ] Thin host **production** wiring (Device action → bus, Resource complete → bus, AYTask completion → `post`) — examples in `docs/host_examples.md`; catalog PODs exist; **not** wired in modules yet
 
 ---
 
@@ -398,3 +403,4 @@ No `ECEventDependence` layer enum, no string `EventRegistry` in v1.
 - EnTT dispatcher — typed sync patterns
 - Unreal: Game Thread / Task Graph separation — events vs tasks
 - Existing in-repo: `AYRuntime/AYGameLoop` `GameLoopEventBus` (typed sync; migrate later)
+

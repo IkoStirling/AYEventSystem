@@ -116,26 +116,30 @@ This satisfies the design §5 contract:
 
 ## D. Script INT-04 — string aliases
 
-Logia's eventual `event.emit("window_resize", {w, h})` does not have
-compile-time type info. Use the alias map:
+Logia's ambient `event.emit("window_resize", w, h)` / `event.subscribe(...)`
+(shipped in AYScript `AYLogiaEventBridge`) has no compile-time EventTypeId.
+Use the alias map:
 
 ```cpp
-// At host bootstrap:
+// At host bootstrap (also done inside installLogiaEventAmbient):
 auto& bus = ayt::event::EventBus::instance();
 bus.registerAlias<WindowResizeEvent>("window_resize");
 bus.registerAlias<WindowCloseEvent>("window_close");
+bus.registerAlias<ResourceLoadCompleteEvent>("resource_ready");
+bus.registerAlias<ScriptTestPingEvent>("script_test_ping");
 
-// Script binding:
+// C++ listener:
 bus.subscribeByAlias<WindowResizeEvent>("window_resize",
-    [](const WindowResizeEvent& e) { scriptEnv.onWindowResize(e.width, e.height); });
+    [](const WindowResizeEvent& e) { /* … */ });
 
-// Logia side:
-bus.emitByAlias<WindowResizeEvent>("window_resize",
-    WindowResizeEvent{ newWidth, newHeight });
+// Logia:
+//   event.subscribe("window_resize", on_resize)
+//   event.emit("window_resize", 1280, 720)
 ```
 
 If the alias was never registered, `emitByAlias` / `postByAlias` return
-`false` — caller should log and skip (do not crash).
+`false` — Script bridge logs and skips (do not crash). Unknown
+`event.subscribe` returns connection id `0`.
 
 ## E. Shutdown — `unsubscribeAll()`
 

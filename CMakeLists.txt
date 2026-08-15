@@ -18,6 +18,11 @@ set(HEADERS
     include/ayevent/Connection.h
     include/ayevent/EventBus.h
     include/ayevent/Events/WindowEvents.h
+    include/ayevent/Events/SceneEvents.h
+    include/ayevent/Events/DeviceEvents.h
+    include/ayevent/Events/ResourceEvents.h
+    include/ayevent/Events/PhysicsEvents.h
+    include/ayevent/Events/ScriptTestEvents.h
 )
 
 add_library(${MODULE_NAME} STATIC ${SOURCES} ${HEADERS})
