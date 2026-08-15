@@ -1,8 +1,9 @@
 #pragma once
 // PhysicsEvents.h — shared POD events (physics range 0x0005'xxxx)
 //
-// Catalog only: PhysicsEventBridge (E-3) may emit later. Host/INT-04 may
-// registerAlias without requiring Physics production wiring in this PR.
+// Produced by AYPhysics PhysicsEventBridge (E-3) after fetchResults on the
+// game thread (PhysicsSubSystem::fixedUpdate). Contact points / impulses
+// stay solver-domain only — bus carries body handles + kind.
 
 #include <ayevent/EventPriority.h>
 
