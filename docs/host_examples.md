@@ -26,6 +26,11 @@ Recommended host frame order (illustrative):
 
 ## A. AYDevice — discrete actions / button edges
 
+**Status: shipped** — `DeviceSubSystem::update` calls `publishPendingInputEvents`
+after `pollEvents`, posting `DeviceActionEvent` for each bound action's
+just-pressed / just-released (`actionId` = FNV-1a of the action name). Window
+resize/close already post `WindowResizeEvent` / `WindowCloseEvent`.
+
 **On the bus**: discrete button edges (`Jump pressed`, `Pause pressed`).
 **Off the bus**: continuous axes / per-frame mouse deltas (those stay on the
 input → UI/game direct path, design §6 "AYDevice" row).
@@ -52,6 +57,9 @@ so it drains before gameplay audio cues. Window/system events should be
 `Critical` (e.g. shutdown, fatal).
 
 ## B. AYResource — worker finish → main thread notifies dependents
+
+**Status: shipped** — `AsyncLoader` posts `ResourceLoadCompleteEvent` /
+`ResourceLoadFailedEvent` from the worker via `post` (`handle` = hash(path)).
 
 **On the bus**: resource load completion / progress / failure.
 **Off the bus**: streaming bytes / IO hot path.
@@ -82,6 +90,10 @@ stall on resource readiness notifications; coalesce on `handle` so progress
 events collapse per-resource.
 
 ## C. AYTask — job completion callback → bus
+
+**Status: shipped (via Host hook)** — AYTask calls `notifyTaskCompleted` after
+`setComplete`; `bindBuiltinHostServices` installs a hook that `post`s
+`TaskCompleteEvent`. AYTask does **not** link AYEventSystem.
 
 ```cpp
 // AYTask scheduler integration

@@ -1,7 +1,7 @@
 ﻿# AYEventSystem Design
 
 **Path**: `D:\Projects\AYRuntime\AYEventSystem\`  
-**Status**: Phase 1–3 core shipped (bus + coalesce + counters + aliases + unsubscribeAll); production Device/Resource/Task wiring still optional (host_examples only); INT-04 Script ambient shipped in AYScript  
+**Status**: Phase 1–3 core + production Device/Resource/Task→bus wiring shipped; INT-04 Script ambient shipped in AYScript; Physics collision bridge still pending  
 **Supersedes**: earlier feature-list draft in this file; rejects AliyatRenderer `Core/EventSystem` architecture
 
 ---
@@ -297,10 +297,10 @@ flowchart LR
 | **AYUI** | Keeps internal `UIEvent` + EventBridge. Host may `post` a few game-facing events (e.g. “pause menu requested”). High-frequency pointer streaming stays off the bus. |
 | **AYScript** | Per-component `signal` / `emit` / `connect` (S4.1) stay local. Global `event.*` (INT-04) bridges onto EventBus via string aliases (**shipped** in AYScript; EventHandler host = INT-04b). |
 | **AYGameLoop** | See §6.1 — `GameLoopEventBus` is an **interim** typed sync bus; target is AYEventSystem. |
-| **AYDevice** | Prefer posting **discrete** actions / button edges; continuous axes/mouse deltas stay in the input → UI/game direct path. |
-| **AYResource** | Worker finish → `post(ResourceLoadCompleteEvent{...})` → main `pump` notifies dependents. |
+| **AYDevice** | Posts **discrete** action edges (`DeviceActionEvent`) + window resize/close. Continuous axes/mouse deltas stay on the input → UI/game direct path. |
+| **AYResource** | Worker finish → `post(ResourceLoadCompleteEvent / Failed)` → main `pump` notifies dependents. |
 | **AYPlatform** | Thread primitives only; no event dispatch. |
-| **AYTask** | Job execution only; completion notifies via EventBus `post` (see §5). |
+| **AYTask** | Job execution only; optional `TaskCompletionHook` — Host posts `TaskCompleteEvent` (no EventSystem link in AYTask). |
 
 ### 6.1 GameLoopEventBus — interim, replace with AYEventSystem
 
@@ -331,13 +331,16 @@ AYRuntime/AYEventSystem/
 │       └── Events/           # shared POD catalog (grow over time)
 │           ├── WindowEvents.h
 │           ├── SceneEvents.h
-│           ├── DeviceEvents.h      # catalog; production wiring deferred
-│           ├── ResourceEvents.h
-│           ├── PhysicsEvents.h
-│           └── ScriptTestEvents.h  # INT-04 test ping
+│           ├── DeviceEvents.h      # DeviceSubSystem posts DeviceActionEvent
+│           ├── ResourceEvents.h    # AsyncLoader posts Complete/Failed
+│           ├── PhysicsEvents.h     # catalog; E-3 collision bridge pending
+│           ├── ScriptTestEvents.h  # INT-04 test ping
+│           └── TaskEvents.h        # Host hook posts TaskCompleteEvent
 └── unittest/
     └── Test_EventBus.cpp
 ```
+
+Also see [`README.md`](README.md) for the production producer table.
 
 No `ECEventDependence` layer enum, no string `EventRegistry` in v1.
 
@@ -367,7 +370,11 @@ No `ECEventDependence` layer enum, no string `EventRegistry` in v1.
 
 - [x] Optional string alias table for Script INT-04 (`registerAlias` / `*ByAlias`; Script ambient ship in AYScript)
 - [x] Migrate `GameLoopEventBus` → AYEventSystem (facade)
-- [ ] Thin host **production** wiring (Device action → bus, Resource complete → bus, AYTask completion → `post`) — examples in `docs/host_examples.md`; catalog PODs exist; **not** wired in modules yet
+- [x] Thin host **production** wiring:
+  - [x] Device action edges → `DeviceActionEvent` (+ window resize/close already shipped)
+  - [x] Resource async complete → `ResourceLoadComplete` / `Failed`
+  - [x] AYTask completion hook → Host posts `TaskCompleteEvent` (Task stays EventSystem-free)
+  - Examples remain in `docs/host_examples.md`; index in `README.md`
 
 ---
 

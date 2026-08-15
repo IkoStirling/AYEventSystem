@@ -1,8 +1,10 @@
 #pragma once
 // DeviceEvents.h — shared POD events (device range 0x0003'xxxx)
 //
-// Catalog only: modules may emit these later. INT-04 / Host may registerAlias
-// without requiring Device production wiring in this PR.
+// Produced by DeviceSubSystem:
+//   - DeviceActionEvent on InputMapping just-pressed / just-released
+//     (actionId = FNV-1a of action name). Continuous axes stay off-bus.
+// Window resize/close use WindowEvents.h (also posted by DeviceSubSystem).
 
 #include <ayevent/EventPriority.h>
 

@@ -23,6 +23,7 @@ set(HEADERS
     include/ayevent/Events/ResourceEvents.h
     include/ayevent/Events/PhysicsEvents.h
     include/ayevent/Events/ScriptTestEvents.h
+    include/ayevent/Events/TaskEvents.h
 )
 
 add_library(${MODULE_NAME} STATIC ${SOURCES} ${HEADERS})
