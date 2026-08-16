@@ -30,4 +30,4 @@ target_compile_options(${TEST_TARGET} PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>: -Wall -Wextra -Wpedantic>
 )
 
-add_test(NAME ${TEST_TARGET} COMMAND ${TEST_TARGET})
+ay_add_test(${TEST_TARGET})
