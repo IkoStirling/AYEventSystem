@@ -22,7 +22,7 @@ notifications. Spec: [`design.md`](design.md). Host patterns:
 | Header | Intent |
 |--------|--------|
 | `DeviceAxisEvent` | Explicitly **not** on the bus (continuous input) |
-| `AYEventSystem/Events/AYEventSystem/Events/AYEventSystem/Events/ScriptTestEvents.h` | INT-04 unit tests |
+| `AYEventSystem/Events/ScriptTestEvents.h` | INT-04 unit tests |
 
 ## Logia string aliases (INT-04 / INT-04b)
 
