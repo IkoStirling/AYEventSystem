@@ -8,6 +8,7 @@ set(TEST_TARGET AYEventSystem_Tests)
 add_executable(${TEST_TARGET}
     main.cpp
     Test_EventBus.cpp
+    Test_SubscriptionScope.cpp
 )
 
 target_link_libraries(${TEST_TARGET} PRIVATE

@@ -11,6 +11,7 @@ set(MODULE_NAME AYEventSystem)
 
 set(SOURCES
     src/AYEventBus.cpp
+    src/AYSubscriptionScope.cpp
 )
 
 set(HEADERS
@@ -18,6 +19,7 @@ set(HEADERS
     include/AYEventSystem/EventPriority.h
     include/AYEventSystem/Connection.h
     include/AYEventSystem/EventBus.h
+    include/AYEventSystem/SubscriptionScope.h
     include/AYEventSystem/Events/WindowEvents.h
     include/AYEventSystem/Events/SceneEvents.h
     include/AYEventSystem/Events/DeviceEvents.h
@@ -46,4 +48,4 @@ target_compile_options(${MODULE_NAME} PRIVATE
 enable_testing()
 add_subdirectory(unittest)
 
-message(STATUS "AYEventSystem v0.1.0 (typed event bus + GameLoopEventBus facade migration) — see ${CMAKE_CURRENT_SOURCE_DIR}/design.md")
+message(STATUS "AYEventSystem v0.1.0 (typed event bus + subscription lifetime scope) — see ${CMAKE_CURRENT_SOURCE_DIR}/design.md")

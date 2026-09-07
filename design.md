@@ -14,6 +14,7 @@
 - **Thread-safe posting**: any thread may `post` work into the bus.
 - **Main-thread dispatch**: listeners always run on the designated main (game) thread via `pump` / synchronous `emit`.
 - **Stable subscription lifetime**: opaque connection tokens + RAII `ScopedConnection`; unsubscribe never compares `std::function` targets.
+- **Owner-scoped cleanup**: `SubscriptionScope` groups connections for explicit teardown without introducing an Application-layer dependency.
 - **Predictable queue semantics**: optional coalesce by type+key; default is no merge / no silent drop.
 - **Clear boundaries**: EventBus is not a job system, not UI bubble, not Script component signals.
 
@@ -410,4 +411,3 @@ No `ECEventDependence` layer enum, no string `EventRegistry` in v1.
 - EnTT dispatcher — typed sync patterns
 - Unreal: Game Thread / Task Graph separation — events vs tasks
 - Existing in-repo: `AYRuntime/AYGameLoop` `GameLoopEventBus` (typed sync; migrate later)
-

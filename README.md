@@ -42,3 +42,10 @@ notifications. Spec: [`design.md`](design.md). Host patterns:
 - `emit` / `subscribe` / `pump` — main thread
 
 GameLoop already `pump`s the process bus each frame.
+
+## Subscription lifetime
+
+`ayt::event::SubscriptionScope` groups typed subscriptions and releases them
+with an explicit `disconnect()`. Its destructor intentionally does not access
+the bus, so application, renderer, and device owners can tear down listeners
+before process-wide static destruction begins.
