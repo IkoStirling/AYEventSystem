@@ -49,3 +49,33 @@ GameLoop already `pump`s the process bus each frame.
 with an explicit `disconnect()`. Its destructor intentionally does not access
 the bus, so application, renderer, and device owners can tear down listeners
 before process-wide static destruction begins.
+# Logical channels and optional history (2026-10-24)
+
+`EventRoute.h` adds owned `EventMetadata` and composable `EventFilter` to the
+existing typed bus. `emit(event, metadata)`, `post(event, metadata)` and routed
+`post_coalesce` use the same delivery path and owner thread. Existing typed
+subscribers receive all channels. `subscribe<T>(filter, handler)` selects one
+payload type; `observe(filter, handler)` selects across types. Both return normal
+connection IDs for `ScopedConnection`. A view is borrowed only during its callback;
+`view.get<T>()` checks its actual C++ payload type.
+
+Filters AND channel/scope/source/tag conditions, OR list alternatives and require
+every requested tag. `channelTree="game.special"` matches that exact channel and
+dot-delimited descendants, with case-sensitive literal names. It is independent
+of `EventPriority` and creates no per-channel threads. Routing is not permission.
+Coalescing includes channel, scope and source; distinct routes cannot overwrite
+one another. Queued payloads remain trivially copyable and are now held in aligned
+typed storage; queued metadata is owned. Core uses only the standard library.
+
+Enable root `AY_ENABLE_EVENT_JOURNAL=ON` and link `AYEventJournal` for explicitly
+selected SQLite history, even with `AY_BUILD_RUNTIME=OFF`. Register a stable name,
+payload version and JSON snapshot codec, then call `capture(view)` from a filtered
+observer and check every receipt. There is no automatic capture or replay.
+`query` applies the same routing filter before bounded sequence pagination.
+See [engine integration and example](../../AYDocs/EVENT-CHANNELS.md),
+`Test_EventRoute.cpp`, and `Test_EventJournal.cpp`.
+
+Local Windows Debug acceptance (MSVC 19.51, 2026-10-24): AYEventSystem_Tests
+62/62 cases, AYEventJournal_Tests 6/6 cases; 262 assertions, zero failures/skips.
+This covers existing bus regressions and the new routing/storage integration,
+not a full editor/runtime or cross-platform certification.

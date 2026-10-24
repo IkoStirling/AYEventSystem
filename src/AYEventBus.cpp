@@ -1,436 +1,148 @@
-// AYEventSystem/src/AYEventBus.cpp
-//
-// Implementation per design.md §3-§4 (Phase 1).
-
 #include <AYEventSystem/EventBus.h>
-
 #include <algorithm>
 #include <cassert>
-#include <unordered_set>
+#include <iterator>
 
-namespace ayt::event
-{
-
-// -----------------------------------------------------------------------------
-// Singleton (process default). Tests construct local EventBus instances.
-// -----------------------------------------------------------------------------
-EventBus& EventBus::instance() {
-    static EventBus s_instance;
-    return s_instance;
-}
-
-EventBus::EventBus() {
-    _queues.resize(static_cast<size_t>(EventPriority::Count));
-}
-
+namespace ayt::event {
+EventBus& EventBus::instance() { static EventBus bus; return bus; }
+EventBus::EventBus() : _queues(static_cast<size_t>(EventPriority::Count)) {}
 EventBus::~EventBus() = default;
-
-// -----------------------------------------------------------------------------
-// Diagnostics
-// -----------------------------------------------------------------------------
-size_t EventBus::listenerCount(EventTypeId tid) const {
-    std::lock_guard<std::mutex> lk(_bucketsMutex);
-    auto it = _buckets.find(tid);
-    if (it == _buckets.end()) return 0;
-    return it->second->listeners.size();
+void EventBus::_assertOwner() const {
+    assert((!_mainThreadCaptured.load(std::memory_order_acquire) || isMainThread()) && "EventBus owner-thread operation");
 }
-
-size_t EventBus::pendingCount() const {
-    std::lock_guard<std::mutex> lk(_postMutex);
-    size_t n = 0;
-    for (auto& q : _queues) n += q.size();
-    return n;
+void EventBus::_captureOwner() {
+    if (!_mainThreadCaptured.load(std::memory_order_acquire)) {
+        _mainThreadId.store(std::this_thread::get_id(),std::memory_order_release);
+        _mainThreadCaptured.store(true,std::memory_order_release);
+    }
+    _assertOwner();
 }
-
 bool EventBus::isMainThread() const {
-    if (!_mainThreadCaptured.load(std::memory_order_acquire)) return false;
-    return std::this_thread::get_id() == _mainThreadId.load(std::memory_order_acquire);
+    return _mainThreadCaptured.load(std::memory_order_acquire) && _mainThreadId.load(std::memory_order_acquire)==std::this_thread::get_id();
 }
-
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
-EventBus::ListenerBucket& EventBus::_bucketFor(EventTypeId tid) {
-    auto it = _buckets.find(tid);
-    if (it == _buckets.end()) {
-        // Insert first (default-constructed unique_ptr) then init the bucket
-        // in place. Two-step avoids the "ref to be-moved" pitfall where the
-        // returned reference might dangle if emplace triggers a rehash.
-        auto [insertedIt, _] = _buckets.emplace(tid, nullptr);
-        insertedIt->second = std::make_unique<ListenerBucket>();
-        return *insertedIt->second;
-    }
-    return *it->second;
+size_t EventBus::listenerCount(EventTypeId tid) const {
+    std::lock_guard lk(_bucketsMutex);
+    auto it=_buckets.find(tid); return it==_buckets.end()?0:it->second.size();
 }
-
-// -----------------------------------------------------------------------------
-// Type-erased subscribe (id already known; for advanced callers).
-// -----------------------------------------------------------------------------
-ConnectionId EventBus::subscribeById(EventTypeId tid,
-                                     std::function<void(const void*)> erased) {
-#ifndef NDEBUG
-    // §2.2 contract: subscribe is main-thread only. Off-main would race
-    // with emit/pump iterating the listener vector. Main-thread capture
-    // may not have happened yet if this is the first bus op; treat that
-    // case as "trust the caller" and let the first emit/pump install the
-    // canonical main-thread id.
-    if (_mainThreadCaptured.load(std::memory_order_acquire)) {
-        assert(isMainThread()
-               && "EventBus::subscribeById called off main thread (forbidden by §2.2)");
-    }
-#endif
-    ConnectionId id = _nextConnectionId.fetch_add(1, std::memory_order_relaxed);
-    auto entry = std::make_unique<ListenerEntry>();
-    entry->id = id;
-    entry->invoke = std::move(erased);
-
-    std::lock_guard<std::mutex> lk(_bucketsMutex);
-    auto& bucket = _bucketFor(tid);
-    if (_deliveryDepth > 0) {
-        std::lock_guard<std::mutex> mlk(_mutationMutex);
-        _pendingAdds.push_back({tid, std::move(entry)});
-    } else {
-        bucket.listeners.push_back(std::move(entry));
-    }
+size_t EventBus::observerCount() const { std::lock_guard lk(_bucketsMutex); return _observers.size(); }
+size_t EventBus::pendingCount() const {
+    std::lock_guard lk(_postMutex); size_t n=0; for (const auto& q:_queues) n+=q.size(); return n;
+}
+ConnectionId EventBus::_subscribe(EventTypeId tid,bool observer,EventFilter filter,std::function<void(const EventView&)> fn) {
+    _assertOwner();
+    if (!fn) return kInvalidConnectionId;
+    auto id=_nextConnectionId.fetch_add(1,std::memory_order_relaxed);
+    auto entry=std::make_unique<ListenerEntry>(ListenerEntry{id,std::move(filter),std::move(fn)});
+    std::lock_guard lk(_bucketsMutex);
+    if (_deliveryDepth) _pendingAdds.push_back({tid,observer,std::move(entry)});
+    else (observer?_observers:_buckets[tid]).push_back(std::move(entry));
     return id;
 }
-
-// -----------------------------------------------------------------------------
-// Unsubscribe by id. Idempotent. Safe during emit/pump delivery.
-// -----------------------------------------------------------------------------
+ConnectionId EventBus::subscribeById(EventTypeId tid,std::function<void(const void*)> fn) {
+    if (!fn) return kInvalidConnectionId;
+    return _subscribe(tid,false,{},[h=std::move(fn)](const EventView& v){h(v.payload);});
+}
+ConnectionId EventBus::observe(EventFilter filter,std::function<void(const EventView&)> fn) {
+    return _subscribe(0,true,std::move(filter),std::move(fn));
+}
 void EventBus::unsubscribe(ConnectionId id) {
-    if (id == kInvalidConnectionId) return;
-#ifndef NDEBUG
-    // §2.2 contract: unsubscribe is main-thread only. Off-main would race
-    // with the snapshot a concurrent emit grabbed for raw-ptr delivery.
-    if (_mainThreadCaptured.load(std::memory_order_acquire)) {
-        assert(isMainThread()
-               && "EventBus::unsubscribe called off main thread (forbidden by §2.2)");
-    }
-#endif
-
-    bool inDelivery = false;
-    {
-        // Peek delivery depth under buckets lock for consistency with other ops.
-        std::lock_guard<std::mutex> lk(_bucketsMutex);
-        inDelivery = (_deliveryDepth > 0);
-    }
-    if (inDelivery) {
-        // We don't know which type owns this id without searching; defer.
-        // The deferred remove runs against every bucket on flush.
-        std::lock_guard<std::mutex> mlk(_mutationMutex);
-        _pendingRemoves.push_back({0 /* sentinel: search all */, id});
-        return;
-    }
+    _assertOwner();
+    if (!id) return;
+    { std::lock_guard lk(_bucketsMutex); if (_deliveryDepth) { _pendingRemoves.push_back(id); return; } }
     _unsubscribeRaw(id);
 }
-
 void EventBus::_unsubscribeRaw(ConnectionId id) {
-    if (id == kInvalidConnectionId) return;
-    std::lock_guard<std::mutex> lk(_bucketsMutex);
-    for (auto& kv : _buckets) {
-        auto& bucket = *kv.second;
-        auto it = std::find_if(bucket.listeners.begin(), bucket.listeners.end(),
-            [id](const std::unique_ptr<ListenerEntry>& e) { return e->id == id; });
-        if (it != bucket.listeners.end()) {
-            bucket.listeners.erase(it);
-            return;
-        }
-    }
-    // Also try pending adds: a subscribe during emit may have pushed the id
-    // there. Drain into a snapshot and look for it.
-    std::lock_guard<std::mutex> mlk(_mutationMutex);
-    for (auto& a : _pendingAdds) {
-        if (a.entry && a.entry->id == id) {
-            a.entry.reset(); // mark for removal on flush
-            return;
-        }
-    }
+    std::lock_guard lk(_bucketsMutex);
+    auto remove=[id](auto& entries) { std::erase_if(entries,[id](const auto& e){return e->id==id;}); };
+    remove(_observers); for (auto& [tid,bucket]:_buckets) remove(bucket);
+    std::erase_if(_pendingAdds,[id](const auto& a){return a.entry->id==id;});
 }
-
-// -----------------------------------------------------------------------------
-// Phase 3: unsubscribeAll — drop every listener. Call only when no emit/pump
-// is in flight (e.g. shutdown).
-// -----------------------------------------------------------------------------
 void EventBus::unsubscribeAll() {
-#ifndef NDEBUG
-    // Contract: caller must ensure no emit/pump is currently iterating.
-    // Forcibly clobbering _deliveryDepth to 0 mid-flight would orphan
-    // pending adds/removes and silently break reentrancy safety.
-    assert(_deliveryDepth == 0
-           && "EventBus::unsubscribeAll called while delivery in flight "
-              "(would orphan pending adds/removes)");
-    if (_mainThreadCaptured.load(std::memory_order_acquire)) {
-        assert(isMainThread()
-               && "EventBus::unsubscribeAll called off main thread (forbidden by §2.2)");
-    }
-#endif
-    std::lock_guard<std::mutex> blk(_bucketsMutex);
-    std::lock_guard<std::mutex> mlk(_mutationMutex);
-    for (auto& kv : _buckets) {
-        // Defensive: kv.second is unique_ptr; skip if somehow null. Should
-        // never be null after _bucketFor's two-step insert, but guard anyway
-        // against any future caller manually manipulating the map.
-        if (kv.second) {
-            kv.second->listeners.clear();
-        }
-    }
-    _pendingAdds.clear();
-    _pendingRemoves.clear();
-    _deliveryDepth = 0;
+    _assertOwner(); std::lock_guard lk(_bucketsMutex);
+    assert(_deliveryDepth==0 && "unsubscribeAll during delivery");
+    _buckets.clear(); _observers.clear(); _pendingAdds.clear(); _pendingRemoves.clear();
 }
-
-// -----------------------------------------------------------------------------
-// Phase 3: alias → EventTypeId lookup.
-// -----------------------------------------------------------------------------
 EventTypeId EventBus::aliasToTypeId(std::string_view alias) const {
-    std::lock_guard<std::mutex> lk(_aliasMutex);
-    auto it = _aliases.find(std::string(alias));
-    if (it == _aliases.end()) return 0;
-    return it->second;
+    std::lock_guard lk(_aliasMutex); auto it=_aliases.find(std::string(alias)); return it==_aliases.end()?0:it->second;
 }
-
-// -----------------------------------------------------------------------------
-// Synchronous emit
-// -----------------------------------------------------------------------------
-void EventBus::_emit(EventTypeId tid, const void* payload) {
-    // Capture main-thread identity on first emit (lazily).
-    if (!_mainThreadCaptured.load(std::memory_order_acquire)) {
-        _mainThreadId.store(std::this_thread::get_id(), std::memory_order_release);
-        _mainThreadCaptured.store(true, std::memory_order_release);
-    }
-#ifndef NDEBUG
-    assert(_mainThreadId.load(std::memory_order_acquire) == std::this_thread::get_id()
-           && "EventBus::emit called off main thread");
-#endif
-
-    // Snapshot listeners under lock AND bump _deliveryDepth within the same
-    // critical section. This closes the F2 window where a worker thread
-    // could observe depth==0, grab _bucketsMutex, erase a listener, and free
-    // the ListenerEntry while the emit-side snapshot still holds a raw ptr
-    // to it. With depth bumped under the lock, concurrent unsubscribe(from
-    // another thread) — though forbidden by §2.2 — would always enter the
-    // pending-removes path when it saw depth>0, leaving the entry alive
-    // until _flushPendingMutations fires after delivery.
+void EventBus::_emit(const EventView& view) {
+    _captureOwner();
     std::vector<ListenerEntry*> snapshot;
     {
-        std::lock_guard<std::mutex> lk(_bucketsMutex);
-        auto it = _buckets.find(tid);
-        if (it == _buckets.end()) return;
-        snapshot.reserve(it->second->listeners.size());
-        for (auto& e : it->second->listeners) snapshot.push_back(e.get());
-        _deliveryDepth++;
+        std::lock_guard lk(_bucketsMutex);
+        auto add=[&](auto& bucket){for (auto& e:bucket) snapshot.push_back(e.get());};
+        auto it=_buckets.find(view.typeId); if (it!=_buckets.end()) add(it->second);
+        add(_observers);
+        if (snapshot.empty()) return;
+        ++_deliveryDepth;
     }
-
-    // Invoke in registration order. Per design §3.5, nested post/emit is
-    // allowed; mutations made by handlers are deferred until deliveryDepth
-    // returns to zero.
-    for (auto* e : snapshot) {
-        // The entry pointer is alive for the duration of delivery because
-        // either (a) we're on the main thread — same thread as emit/pump,
-        // so no other thread can race unsubscribe, and same-thread unsub
-        // routes through pending-removes (depth>0 here), or (b) we're
-        // contract-violated and another thread called unsubscribe — even
-        // then, depth>0 makes _unsubscribeRaw defer to pending-removes,
-        // so the entry survives until _flushPendingMutations runs below.
-        e->invoke(payload);
-    }
-    _totalDelivered.fetch_add(1, std::memory_order_relaxed);
-    {
-        std::lock_guard<std::mutex> lk(_bucketsMutex);
-        _deliveryDepth--;
-    }
-    if (_deliveryDepth == 0) _flushPendingMutations();
+    try {
+        bool delivered=false;
+        for (auto* e:snapshot) if (e->filter.matches(view.metadata)) {e->invoke(view); delivered=true;}
+        if (delivered) _totalDelivered.fetch_add(1,std::memory_order_relaxed);
+    } catch (...) { _finishDelivery(); throw; }
+    _finishDelivery();
 }
-
-// -----------------------------------------------------------------------------
-// Post — queue for next pump. Safe from any thread.
-// -----------------------------------------------------------------------------
-// Packet layout (header is fixed-size; no dynamic fields):
-//   [EventTypeId tid][uint32_t payloadSize][uint64_t coalesceKey][uint8_t hasCoalesceKey][payload bytes]
-// Header size: 4 + 4 + 8 + 1 = 17, rounded up to 24 for alignment.
-namespace {
-struct PostEnvelope {
-    EventTypeId tid;
-    uint32_t    payloadSize;
-    uint64_t    coalesceKey;
-    uint8_t     hasCoalesceKey; // 0 = no coalesce, 1 = coalesce on key
-    uint8_t     _pad[7];        // align to 8 bytes
-};
-static_assert(sizeof(PostEnvelope) == 24, "PostEnvelope layout must match header packing");
-constexpr size_t kHeaderSize = sizeof(PostEnvelope);
-} // namespace
-
-void EventBus::_updatePeakDepth() {
-    size_t total = 0;
-    for (auto& q : _queues) total += q.size();
-    uint64_t cur = _peakQueueDepth.load(std::memory_order_relaxed);
-    while (static_cast<uint64_t>(total) > cur) {
-        if (_peakQueueDepth.compare_exchange_weak(cur, total, std::memory_order_relaxed)) {
-            break;
-        }
-    }
+void EventBus::_finishDelivery() {
+    bool flush;
+    {std::lock_guard lk(_bucketsMutex); flush=--_deliveryDepth==0;}
+    if (flush) _flushPendingMutations();
 }
-
-void EventBus::_post(EventTypeId tid, EventPriority prio, uint64_t coalesceKey,
-                     bool hasCoalesceKey, std::vector<uint8_t> bytes) {
-    size_t idx = static_cast<size_t>(prio);
-#ifndef NDEBUG
-    // Defensive: a stray EventPriority cast from int or post-load enum drift
-    // would silently re-bucket into Normal and the user would never know.
-    assert(idx < _queues.size()
-           && "EventBus::_post received out-of-range EventPriority; expected one of "
-              "Critical/High/Normal/Low (Count=4). Will fall back to Normal in release.");
-#endif
-    if (idx >= _queues.size()) idx = static_cast<size_t>(EventPriority::Normal);
-
-    std::lock_guard<std::mutex> lk(_postMutex);
-
-    // Coalesce path (Phase 2 §4.2): scan current priority bucket for an
-    // existing pending packet with same TID + coalesceKey. If found, replace
-    // the payload in-place. This keeps FIFO position of the FIRST coalesce
-    // hit (so a coalesced event still fires in its original relative order,
-    // but with the latest payload).
-    if (hasCoalesceKey) {
-        auto& bucket = _queues[idx];
-        for (auto& packet : bucket) {
-            if (packet.size() < kHeaderSize) continue;
-            PostEnvelope existing;
-            std::memcpy(&existing, packet.data(), kHeaderSize);
-            if (existing.tid == tid && existing.hasCoalesceKey
-                && existing.coalesceKey == coalesceKey) {
-                // Replace payload bytes in-place. If sizes differ, resize.
-                packet.resize(kHeaderSize + bytes.size());
-                PostEnvelope newHeader = existing;
-                newHeader.payloadSize = static_cast<uint32_t>(bytes.size());
-                std::memcpy(packet.data(), &newHeader, kHeaderSize);
-                if (!bytes.empty()) {
-                    std::memcpy(packet.data() + kHeaderSize, bytes.data(), bytes.size());
-                }
-                _totalCoalesced.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
-    }
-
-    // Fresh post path.
-    std::vector<uint8_t> packet(kHeaderSize + bytes.size());
-    PostEnvelope env{ tid, static_cast<uint32_t>(bytes.size()),
-                      coalesceKey, static_cast<uint8_t>(hasCoalesceKey ? 1 : 0),
-                      {0,0,0,0,0,0,0} };
-    std::memcpy(packet.data(), &env, kHeaderSize);
-    if (!bytes.empty()) {
-        std::memcpy(packet.data() + kHeaderSize, bytes.data(), bytes.size());
-    }
-    _queues[idx].push_back(std::move(packet));
-    _totalPosted.fetch_add(1, std::memory_order_relaxed);
-    _updatePeakDepth();
-}
-
-// -----------------------------------------------------------------------------
-// Pump — drain Critical→Low, drain nested posts in same call.
-// -----------------------------------------------------------------------------
-void EventBus::pump() {
-    if (!_mainThreadCaptured.load(std::memory_order_acquire)) {
-        _mainThreadId.store(std::this_thread::get_id(), std::memory_order_release);
-        _mainThreadCaptured.store(true, std::memory_order_release);
-    }
-#ifndef NDEBUG
-    assert(_mainThreadId.load(std::memory_order_acquire) == std::this_thread::get_id()
-           && "EventBus::pump called off main thread");
-#endif
-
-    // Safety cap to prevent infinite re-entrant posting cycles in tests.
-    constexpr int kMaxPumpIterations = 1024;
-
-    for (int iter = 0; iter < kMaxPumpIterations; ++iter) {
-        bool anyDrained = false;
-
-        for (size_t prio = 0; prio < _queues.size(); ++prio) {
-            std::vector<std::vector<uint8_t>> batch;
-            {
-                std::lock_guard<std::mutex> lk(_postMutex);
-                if (_queues[prio].empty()) continue;
-                batch.swap(_queues[prio]);
-            }
-            anyDrained = true;
-
-            for (auto& packet : batch) {
-                if (packet.size() < kHeaderSize) continue;
-                PostEnvelope env;
-                std::memcpy(&env, packet.data(), kHeaderSize);
-                const void* payload = packet.data() + kHeaderSize;
-                _emit(env.tid, payload);
-            }
-        }
-        if (!anyDrained) break;
-    }
-#ifndef NDEBUG
-    // If we exited via cap, at least one bucket had items.
-    if (pendingCount() > 0) {
-        // Note: this is a soft signal; not assert in production.
-        // assert(false && "EventBus::pump hit iteration cap — possible runaway cycle");
-    }
-#endif
-}
-
-// -----------------------------------------------------------------------------
-// Apply mutations deferred during delivery.
-// Lock order: _bucketsMutex BEFORE _mutationMutex.
-// -----------------------------------------------------------------------------
 void EventBus::_flushPendingMutations() {
-    // Lock order matters: buckets first, then mutation list.
-    std::lock_guard<std::mutex> blk(_bucketsMutex);
-    std::lock_guard<std::mutex> mlk(_mutationMutex);
-
-    for (auto& add : _pendingAdds) {
-        if (!add.entry) continue; // canceled by _unsubscribeRaw
-        auto& bucket = _bucketFor(add.tid);
-        bucket.listeners.push_back(std::move(add.entry));
-    }
-    // Drop dead pending-adds (those canceled mid-delivery by _unsubscribeRaw)
-    // so the backlog shrinks back to zero instead of accruing forever under
-    // subscribe/unsubscribe-during-emit hot loops.
-    _pendingAdds.erase(
-        std::remove_if(_pendingAdds.begin(), _pendingAdds.end(),
-                       [](const PendingAdd& a) { return !a.entry; }),
-        _pendingAdds.end());
-
-    // Pending removes: tid==0 means "search all buckets" (we don't track
-    // owning type for unsubscribes that happened during delivery).
-    for (auto& rem : _pendingRemoves) {
-        if (rem.tid != 0) {
-            auto it = _buckets.find(rem.tid);
-            if (it != _buckets.end()) {
-                auto& bucket = *it->second;
-                auto fit = std::find_if(bucket.listeners.begin(), bucket.listeners.end(),
-                    [&rem](const std::unique_ptr<ListenerEntry>& e) { return e->id == rem.id; });
-                if (fit != bucket.listeners.end()) bucket.listeners.erase(fit);
-            }
-        } else {
-            for (auto& kv : _buckets) {
-                auto& bucket = *kv.second;
-                auto fit = std::find_if(bucket.listeners.begin(), bucket.listeners.end(),
-                    [&rem](const std::unique_ptr<ListenerEntry>& e) { return e->id == rem.id; });
-                if (fit != bucket.listeners.end()) {
-                    bucket.listeners.erase(fit);
-                    break;
-                }
-            }
-        }
+    std::lock_guard lk(_bucketsMutex);
+    for (auto& a:_pendingAdds) (a.observer?_observers:_buckets[a.tid]).push_back(std::move(a.entry));
+    _pendingAdds.clear();
+    for (auto id:_pendingRemoves) {
+        auto remove=[id](auto& entries){std::erase_if(entries,[id](const auto& e){return e->id==id;});};
+        remove(_observers); for (auto& [tid,bucket]:_buckets) remove(bucket);
     }
     _pendingRemoves.clear();
 }
-
-// -----------------------------------------------------------------------------
-// ScopedConnection::reset — defined out-of-line to access bus internals.
-// -----------------------------------------------------------------------------
-void ScopedConnection::reset() {
-    if (_bus && _id != kInvalidConnectionId) {
-        _bus->unsubscribe(_id);
-        _id = kInvalidConnectionId;
-        _bus = nullptr;
+void EventBus::_post(EventPriority priority,Packet packet) {
+    size_t idx=static_cast<size_t>(priority);
+    assert(idx<_queues.size() && "Invalid event priority");
+    if (idx>=_queues.size()) idx=static_cast<size_t>(EventPriority::Normal);
+    std::lock_guard lk(_postMutex);
+    auto& bucket=_queues[idx];
+    if (packet.coalesce) for (auto& old:bucket) {
+        if (old.coalesce && old.tid==packet.tid && old.key==packet.key &&
+            old.metadata.channel==packet.metadata.channel && old.metadata.scope==packet.metadata.scope && old.metadata.source==packet.metadata.source) {
+            old=std::move(packet); _totalCoalesced.fetch_add(1,std::memory_order_relaxed); return;
+        }
+    }
+    bucket.push_back(std::move(packet)); _totalPosted.fetch_add(1,std::memory_order_relaxed);
+    uint64_t depth=0; for (const auto& q:_queues) depth+=q.size();
+    auto peak=_peakQueueDepth.load(std::memory_order_relaxed);
+    while (depth>peak && !_peakQueueDepth.compare_exchange_weak(peak,depth,std::memory_order_relaxed)) {}
+}
+void EventBus::pump() {
+    _captureOwner();
+    for (int iteration=0;iteration<1024;++iteration) {
+        bool drained=false;
+        for (size_t priority=0;priority<_queues.size();++priority) {
+            std::vector<Packet> batch;
+            { std::lock_guard lk(_postMutex); batch.swap(_queues[priority]); }
+            if (!batch.empty()) drained=true;
+            for (size_t i=0;i<batch.size();++i) {
+                const auto& p=batch[i];
+                try { _emit({p.tid,p.metadata,p.payloadType,p.payload.get()}); }
+                catch (...) {
+                    // Failed delivery is not replayed; preserve all unstarted
+                    // events ahead of posts made by the failing callback.
+                    std::lock_guard lk(_postMutex);
+                    auto& q=_queues[priority];
+                    q.insert(q.begin(),std::make_move_iterator(batch.begin()+i+1),std::make_move_iterator(batch.end()));
+                    uint64_t depth=0; for (const auto& pending:_queues) depth+=pending.size();
+                    auto peak=_peakQueueDepth.load(std::memory_order_relaxed);
+                    while (depth>peak && !_peakQueueDepth.compare_exchange_weak(peak,depth,std::memory_order_relaxed)) {}
+                    throw;
+                }
+            }
+        }
+        if (!drained) break;
     }
 }
-
-} // namespace ayt::event
+void ScopedConnection::reset() {
+    if (_bus && _id!=kInvalidConnectionId) {_bus->unsubscribe(_id); _id=kInvalidConnectionId; _bus=nullptr;}
+}
+}

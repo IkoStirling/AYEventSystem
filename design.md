@@ -1,6 +1,6 @@
 # AYEventSystem Design
 
-**Path**: `D:\Projects\AYRuntime\AYEventSystem\`  
+**Path**: `AYRuntime/AYEventSystem/`
 **Status**: Phase 1–3 core + production Device/Resource/Task→bus wiring shipped; INT-04 Script ambient shipped in AYScript; Physics collision bridge still pending  
 **Supersedes**: earlier feature-list draft in this file; rejects AliyatRenderer `Core/EventSystem` architecture
 
@@ -411,3 +411,49 @@ No `ECEventDependence` layer enum, no string `EventRegistry` in v1.
 - EnTT dispatcher — typed sync patterns
 - Unreal: Game Thread / Task Graph separation — events vs tasks
 - Existing in-repo: `AYRuntime/AYGameLoop` `GameLoopEventBus` (typed sync; migrate later)
+# Logical routing and journal extension (2026-10-24)
+
+This extension supersedes the earlier packed-byte queue description.
+`EventMetadata` owns channel/scope/source/correlation/eventId/time/tags. A queued
+packet owns a `shared_ptr<const void>` created from the actual typed allocation,
+its `type_index`, route and coalescing key. This preserves over-aligned payloads
+and destruction lifetime while retaining the trivially-copyable public restriction.
+There is one queue per priority, no queue or thread per channel. Empty metadata is
+the legacy route; existing subscriptions are unrestricted.
+
+Typed listeners run before cross-type observers, each group in registration order.
+Subscription mutations, including observer tokens, are deferred until the
+outermost delivery ends, including exception cleanup. A throwing callback aborts
+that event's remaining callbacks and propagates. During pump, the current event
+is not retried; unstarted batch packets are requeued before newly posted packets.
+The owner must handle exceptions; bus delivery is not a durability guarantee.
+Observers may nested-emit, so history sequences reflect actual capture order,
+not causal order. Producers should treat payloads as immutable during delivery.
+
+`EventJournal` is a separate optional link target depending on AYStorage's checked
+SQLite interface, AYSerializer validation and nlohmann JSON. Core remains std-only.
+Trusted composition registers immutable per-type codecs; conversion runs outside
+the storage mutex. Capture creates an owned bounded JSON snapshot synchronously,
+never persists pointers, RTTI or transient type IDs, and returns a receipt. It
+does not own a bus/listener; host retains a normal ScopedConnection and handles
+receipts. No background writer, silent fallback, replay, or automatic state updates.
+
+Private SQLite schema 1: ay_event_meta(version), ay_events(seq,type,channel,scope,
+source,event_id,body), ay_event_tags(seq,tag), with channel/scope/tag indexes.
+BEGIN IMMEDIATE and synchronous FULL cover snapshot plus tag rows atomically.
+Unknown database versions fail. Empty event IDs append separately; nonempty IDs
+are globally unique in one journal. Canonicalized tag order makes duplicate
+capture idempotent; differing snapshot bytes under one ID return Conflict.
+The JSON body stores stable payload type/schema, payload JSON text and route.
+No update/delete API, migrations or retention policy; backup is host-owned.
+
+Queries bind literal filters in SQL before LIMIT, require all tags, and sort by
+database sequence. Paging uses afterSequence plus optional throughSequence;
+nextSequence advances only across returned matching rows. Page and byte bounds
+are explicit; an oversized first row returns Limit, otherwise a partial page
+sets more. Records are owned; reading never emits or executes events.
+This is an observation journal, not an event-sourced state store or transactional
+outbox. Durable facts must be emitted after authoritative state commit; atomic
+state+event publication still requires a separate host transaction/outbox design.
+Business privacy/permissions, event taxonomies, UI presentation and retention
+belong to the application. See [engine contract](../../AYDocs/EVENT-CHANNELS.md).

@@ -9,6 +9,7 @@ add_executable(${TEST_TARGET}
     main.cpp
     Test_EventBus.cpp
     Test_SubscriptionScope.cpp
+    Test_EventRoute.cpp
 )
 
 target_link_libraries(${TEST_TARGET} PRIVATE
@@ -31,4 +32,10 @@ target_compile_options(${TEST_TARGET} PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>: -Wall -Wextra -Wpedantic>
 )
 
-ay_add_test(${TEST_TARGET})
+ay_add_test(${TEST_TARGET} CASE_REPORT)
+if(TARGET AYEventJournal)
+    add_executable(AYEventJournal_Tests main.cpp Test_EventJournal.cpp)
+    target_link_libraries(AYEventJournal_Tests PRIVATE AYEventJournal AYStorage AYTest)
+    target_compile_definitions(AYEventJournal_Tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN AY_EVENT_TEST_MODULE="AYEventJournal")
+    ay_add_test(AYEventJournal_Tests CASE_REPORT LABELS "events;storage;integration")
+endif()

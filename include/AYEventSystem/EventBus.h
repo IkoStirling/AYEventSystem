@@ -1,312 +1,161 @@
 #pragma once
-// AYEventSystem/EventBus.h
-//
-// Engine-wide typed deferred + sync bus.
-//
-// Thread contract (design §2.2):
-//   - post<T>    — any thread, queues until pump.
-//   - emit<T>    — main thread only, immediate.
-//   - pump       — main thread only, drains Critical→Low.
-//   - subscribe  — main preferred; off-main needs external sync w.r.t. pump.
-//
-// See design.md §3 for the full spec; this is the Phase 1 surface.
-
-#include <AYEventSystem/EventPriority.h>
+#include <AYEventSystem/EventRoute.h>
 #include <AYEventSystem/Connection.h>
-
 #include <atomic>
-#include <cstdint>
-#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <string_view>
 #include <thread>
 #include <type_traits>
-#include <typeindex>
-#include <typeinfo>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
-namespace ayt::event
-{
-
-// -----------------------------------------------------------------------------
-// Internal erased listener entry. Per-type invocation goes through invoke().
-// Each entry owns its ConnectionId; unsubscribe removes by id alone.
-// -----------------------------------------------------------------------------
-struct ListenerEntry {
-    ConnectionId id = kInvalidConnectionId;
-    std::function<void(const void*)> invoke; // takes address of event payload
-};
-
-// -----------------------------------------------------------------------------
-// EventBus
-// -----------------------------------------------------------------------------
+namespace ayt::event {
+/// Typed sync/deferred bus. emit/pump/subscriptions belong to one owner thread;
+/// post is thread safe. Mutations during delivery apply after outermost delivery.
+/// Channels select existing deliveries; they create no extra queue or thread.
 class EventBus {
 public:
     static EventBus& instance();
-
     EventBus();
     ~EventBus();
-
     EventBus(const EventBus&) = delete;
     EventBus& operator=(const EventBus&) = delete;
-
-    // ----- Subscribe (typed) --------------------------------------------------
     template<typename TEvent>
     ConnectionId subscribe(std::function<void(const TEvent&)> handler) {
-        EventTypeId tid = _typeIdOf<TEvent>();
-        ConnectionId id = _nextConnectionId.fetch_add(1, std::memory_order_relaxed);
-
-        auto entry = std::make_unique<ListenerEntry>();
-        entry->id = id;
-        entry->invoke = [h = std::move(handler)](const void* p) {
+        return subscribeById(_typeIdOf<TEvent>(), [h=std::move(handler)](const void* p) {
             h(*static_cast<const TEvent*>(p));
-        };
-
-        std::lock_guard<std::mutex> lk(_bucketsMutex);
-        auto& bucket = _bucketFor(tid);
-        if (_deliveryDepth > 0) {
-            std::lock_guard<std::mutex> mlk(_mutationMutex);
-            _pendingAdds.push_back({tid, std::move(entry)});
-        } else {
-            bucket.listeners.push_back(std::move(entry));
-        }
-        return id;
+        });
     }
-
-    // Type-erased subscribe (for callers that already have an EventTypeId).
-    ConnectionId subscribeById(EventTypeId tid,
-                               std::function<void(const void*)> erased);
-
-    // Remove a listener by its opaque id. Idempotent; safe during delivery.
+    /// Filter a typed subscription. Legacy subscriptions receive every channel.
+    template<typename TEvent>
+    ConnectionId subscribe(EventFilter filter,
+            std::function<void(const TEvent&, const EventMetadata&)> handler) {
+        return _subscribe(_typeIdOf<TEvent>(),false,std::move(filter),
+            [h=std::move(handler)](const EventView& v) { h(*static_cast<const TEvent*>(v.payload),v.metadata); });
+    }
+    ConnectionId subscribeById(EventTypeId tid, std::function<void(const void*)> erased);
+    /// Observe multiple payload types on this same bus. Called after typed
+    /// listeners, in observer registration order. Retain a ScopedConnection.
+    ConnectionId observe(EventFilter filter, std::function<void(const EventView&)> handler);
     void unsubscribe(ConnectionId id);
-
-    // Phase 3 §8: drop every listener across every type on this bus instance.
-    // Intended for shutdown (e.g. GameLoop end-of-session). Safe to call from
-    // main thread only; do NOT call while a pump or emit is in flight.
+    /// Owner thread only, outside delivery. Does not discard queued events.
     void unsubscribeAll();
-
-    // ----- Synchronous emit (main thread only, design §2.2) -------------------
+    /// Deliver immediately on the designated owner thread using the default route.
+    /// Callback exceptions propagate after deferred subscription cleanup.
     template<typename TEvent>
-    void emit(const TEvent& event) {
-        EventTypeId tid = _typeIdOf<TEvent>();
-        _emit(tid, &event);
-    }
-
-    // ----- Deferred post (any thread, design §2.2) ----------------------------
+    void emit(const TEvent& event) { emit(event,{}); }
     template<typename TEvent>
-    void post(TEvent event) {
-        // Enforced payload contract (design §3.2 + §12.1): the queued payload
-        // is byte-copied into the vector and never destructed, so non-trivial
-        // types (std::string, std::vector, anything with a dtor) would leak
-        // resources and leave dangling heap pointers. Use emit() for those,
-        // or carry id / fixed buffer / trivially-copyable fields instead.
-        static_assert(std::is_trivially_copyable_v<TEvent>,
-            "EventBus::post<TEvent>: TEvent must be trivially_copyable. "
-            "Non-trivial payloads (std::string, std::vector, owning types) "
-            "must be delivered via emit() (main-thread sync) or carry an id / "
-            "fixed buffer in the event payload instead.");
-        EventTypeId tid = _typeIdOf<TEvent>();
-        EventPriority prio = EventPriority::Normal;
-        if constexpr (requires { TEvent::kPriority; }) {
-            prio = TEvent::kPriority;
-        }
-        // Serialize payload into bytes; queued vector owns its memory.
-        std::vector<uint8_t> bytes(sizeof(TEvent));
-        std::memcpy(bytes.data(), &event, sizeof(TEvent));
-        _post(tid, prio, /*coalesceKey=*/0, /*hasCoalesceKey=*/false, std::move(bytes));
-        (void)event; // event was memcpy'd; prevent UB from moved-from copies.
+    void emit(const TEvent& event, EventMetadata metadata) {
+        _emit({_typeIdOf<TEvent>(),metadata,typeid(TEvent),&event});
     }
-
-    // ----- Coalescing post (Phase 2 §4.2) -------------------------------------
-    // Among pending items of type T with the same key, keep only the latest
-    // (replace the existing pending payload). Useful for window resize /
-    // resource progress events where only the final state matters.
-    // Key 0 is reserved as a valid singleton key — every post uses hasCoalesceKey
-    // flag to distinguish "no coalesce" from "coalesce on key 0".
     template<typename TEvent>
-    void post_coalesce(uint64_t key, TEvent event) {
-        // Same payload contract as post(): trivially_copyable, or the queued
-        // payload (and any heap it owns) will silently leak / dangle.
-        static_assert(std::is_trivially_copyable_v<TEvent>,
-            "EventBus::post_coalesce<TEvent>: TEvent must be trivially_copyable. "
-            "Non-trivial payloads must be delivered via emit() or carry "
-            "id / fixed buffer in the event payload instead.");
-        EventTypeId tid = _typeIdOf<TEvent>();
-        EventPriority prio = EventPriority::Normal;
-        if constexpr (requires { TEvent::kPriority; }) {
-            prio = TEvent::kPriority;
-        }
-        std::vector<uint8_t> bytes(sizeof(TEvent));
-        std::memcpy(bytes.data(), &event, sizeof(TEvent));
-        _post(tid, prio, key, /*hasCoalesceKey=*/true, std::move(bytes));
-        (void)event;
+    void post(TEvent event) { post(std::move(event),{}); }
+    /// Owns both metadata and an aligned payload copy until pump. The existing
+    /// trivially-copyable payload restriction remains for queued engine events.
+    template<typename TEvent>
+    void post(TEvent event, EventMetadata metadata) {
+        _queue<TEvent>(std::move(event),std::move(metadata),0,false);
     }
-
-    // ----- Pump (main thread only, design §2.2) ------------------------------
+    template<typename TEvent>
+    void post_coalesce(uint64_t key, TEvent event) { post_coalesce(key,std::move(event),{}); }
+    /// Coalescing identity: type + priority + channel + scope + source + key.
+    /// Replaces the entire metadata/payload, retaining the first FIFO position.
+    template<typename TEvent>
+    void post_coalesce(uint64_t key, TEvent event, EventMetadata metadata) {
+        _queue<TEvent>(std::move(event),std::move(metadata),key,true);
+    }
+    /// Drain priorities Critical to Low on the owner, including nested posts
+    /// (bounded to 1024 passes). Callback failure preserves unstarted packets.
     void pump();
-
-    // ----- Diagnostics --------------------------------------------------------
     size_t listenerCount(EventTypeId tid) const;
+    size_t observerCount() const;
     size_t pendingCount() const;
     bool isMainThread() const;
-
-    // Phase 2 §8 counters (atomic; safe to read from any thread).
-    uint64_t totalPosted()    const { return _totalPosted.load(std::memory_order_relaxed); }
+    uint64_t totalPosted() const { return _totalPosted.load(std::memory_order_relaxed); }
     uint64_t totalCoalesced() const { return _totalCoalesced.load(std::memory_order_relaxed); }
     uint64_t totalDelivered() const { return _totalDelivered.load(std::memory_order_relaxed); }
     uint64_t peakQueueDepth() const { return _peakQueueDepth.load(std::memory_order_relaxed); }
-
-    // Reset all counters to zero. Useful for tests / per-frame diagnostics.
-    void resetCounters() {
-        _totalPosted.store(0,    std::memory_order_relaxed);
-        _totalCoalesced.store(0, std::memory_order_relaxed);
-        _totalDelivered.store(0, std::memory_order_relaxed);
-        _peakQueueDepth.store(0, std::memory_order_relaxed);
-    }
-
-    // ----- Phase 3 §8: string aliases for Script INT-04 ------------------------
-    // Map a stable string name to an EventTypeId. After registering, callers
-    // can dispatch by string via emitByAlias / postByAlias — useful for script
-    // bindings where the EventTypeId is not known at compile time.
-    //
-    // Notes:
-    //   - String keys live on the bus instance (NOT process-static) to honour
-    //     the design §3.6 "no static listener vector" rule.
-    //   - registerAlias is main-thread preferred; off-main needs external sync.
-    //   - Type T must be the SAME type that was used to compute tid; we re-use
-    //     _typeIdOf<T> so the mapping is consistent with typed dispatch.
+    void resetCounters() { _totalPosted=0; _totalCoalesced=0; _totalDelivered=0; _peakQueueDepth=0; }
     template<typename TEvent>
     void registerAlias(std::string_view alias) {
-        EventTypeId tid = _typeIdOf<TEvent>();
-        std::lock_guard<std::mutex> lk(_aliasMutex);
-        _aliases.emplace(std::string(alias), tid);
+        auto tid = _typeIdOf<TEvent>();
+        std::lock_guard lk(_aliasMutex);
+        _aliases.emplace(std::string(alias),tid);
     }
-
-    // Look up the EventTypeId for an alias. Returns 0 if unknown.
     EventTypeId aliasToTypeId(std::string_view alias) const;
-
-    // Subscribe / emit / post by alias. Useful for script bindings (INT-04)
-    // and any caller that holds only the string name.
     template<typename TEvent>
-    ConnectionId subscribeByAlias(std::string_view alias,
-                                  std::function<void(const TEvent&)> handler) {
-        ConnectionId id = subscribe<TEvent>(std::move(handler));
-        // Make sure the alias is registered (idempotent).
-        registerAlias<TEvent>(alias);
-        return id;
+    ConnectionId subscribeByAlias(std::string_view alias, std::function<void(const TEvent&)> handler) {
+        auto id=subscribe<TEvent>(std::move(handler)); registerAlias<TEvent>(alias); return id;
     }
-
     template<typename TEvent>
     bool emitByAlias(std::string_view alias, const TEvent& event) {
-        EventTypeId tid = aliasToTypeId(alias);
-        if (tid == 0) return false;
-        emit<TEvent>(event);
-        (void)tid;
-        return true;
+        if (!aliasToTypeId(alias)) return false;
+        emit(event); return true;
     }
-
     template<typename TEvent>
     bool postByAlias(std::string_view alias, TEvent event) {
-        EventTypeId tid = aliasToTypeId(alias);
-        if (tid == 0) return false;
-        post<TEvent>(std::move(event));
-        (void)tid;
-        return true;
+        if (!aliasToTypeId(alias)) return false;
+        post(std::move(event)); return true;
     }
-
-    // Internal accessors used by ScopedConnection. Not public API.
     void _unsubscribeRaw(ConnectionId id);
-
 private:
-    struct ListenerBucket {
-        std::vector<std::unique_ptr<ListenerEntry>> listeners;
+    struct ListenerEntry {
+        ConnectionId id;
+        EventFilter filter;
+        std::function<void(const EventView&)> invoke;
     };
-
-    void _emit(EventTypeId tid, const void* payload);
-    void _post(EventTypeId tid, EventPriority prio, uint64_t coalesceKey,
-               bool hasCoalesceKey, std::vector<uint8_t> bytes);
-    void _updatePeakDepth();
-
+    using ListenerBucket = std::vector<std::unique_ptr<ListenerEntry>>;
+    struct PendingAdd { EventTypeId tid; bool observer; std::unique_ptr<ListenerEntry> entry; };
+    struct Packet {
+        EventTypeId tid;
+        std::type_index payloadType{typeid(void)};
+        std::shared_ptr<const void> payload;
+        EventMetadata metadata;
+        uint64_t key;
+        bool coalesce;
+    };
+    template<typename TEvent>
+    void _queue(TEvent event, EventMetadata metadata, uint64_t key, bool coalesce) {
+        static_assert(std::is_trivially_copyable_v<TEvent>,"Queued events must be trivially_copyable; use emit for owning payloads.");
+        EventPriority priority=EventPriority::Normal;
+        if constexpr (requires { TEvent::kPriority; }) priority=TEvent::kPriority;
+        _post(priority,{_typeIdOf<TEvent>(),typeid(TEvent),std::make_shared<TEvent>(std::move(event)),std::move(metadata),key,coalesce});
+    }
     template<typename TEvent>
     EventTypeId _typeIdOf() {
-        if constexpr (requires { TEvent::kTypeId; }) {
-            return TEvent::kTypeId;
-        } else {
-            EventTypeId tid = 0;
-            std::type_index tag(typeid(TEvent));
-            {
-                std::lock_guard<std::mutex> lk(_bucketsMutex);
-                auto it = _typeIdByTypeInfo.find(tag);
-                if (it != _typeIdByTypeInfo.end()) {
-                    tid = it->second;
-                } else {
-                    tid = _nextRuntimeTypeId.fetch_add(1, std::memory_order_relaxed);
-                    _typeIdByTypeInfo.emplace(tag, tid);
-                }
-            }
-            return tid;
+        if constexpr (requires { TEvent::kTypeId; }) return TEvent::kTypeId;
+        else {
+            std::lock_guard lk(_bucketsMutex);
+            auto [it,inserted]=_typeIdByTypeInfo.try_emplace(typeid(TEvent),0);
+            if (inserted) it->second=_nextRuntimeTypeId.fetch_add(1,std::memory_order_relaxed);
+            return it->second;
         }
     }
-
+    ConnectionId _subscribe(EventTypeId, bool, EventFilter, std::function<void(const EventView&)>);
+    void _emit(const EventView& view);
+    void _post(EventPriority priority, Packet packet);
+    void _captureOwner();
+    void _assertOwner() const;
+    void _finishDelivery();
     void _flushPendingMutations();
-    ListenerBucket& _bucketFor(EventTypeId tid);
-
-private:
     mutable std::mutex _bucketsMutex;
-    std::unordered_map<EventTypeId, std::unique_ptr<ListenerBucket>> _buckets;
-    // Side map for runtime-assigned ids keyed by std::type_index.
-    std::unordered_map<std::type_index, EventTypeId> _typeIdByTypeInfo;
-
-    // Deferred queue: one vector per priority bucket. Protected by _postMutex
-    // so workers may post without holding the listener-bucket mutex.
+    std::unordered_map<EventTypeId,ListenerBucket> _buckets;
+    ListenerBucket _observers;
+    std::unordered_map<std::type_index,EventTypeId> _typeIdByTypeInfo;
+    std::vector<PendingAdd> _pendingAdds;
+    std::vector<ConnectionId> _pendingRemoves;
+    int _deliveryDepth=0;
     mutable std::mutex _postMutex;
-    std::vector<std::vector<std::vector<uint8_t>>> _queues; // [priority] -> bytes
-
-    // Mutation backlog: subscribe / unsubscribe / new-bucket registrations
-    // made during delivery. Applied by _flushPendingMutations().
-    mutable std::mutex _mutationMutex;
-    struct PendingAdd {
-        EventTypeId tid;
-        std::unique_ptr<ListenerEntry> entry;
-    };
-    struct PendingRemove {
-        EventTypeId tid;
-        ConnectionId id;
-    };
-    std::vector<PendingAdd>    _pendingAdds;
-    std::vector<PendingRemove> _pendingRemoves;
-
-    // Reentrancy depth tracking: nested emit/pump bump this; mutations are
-    // deferred until depth returns to 0.
-    int _deliveryDepth = 0;
-
-    // Main thread identity (design §2.2 debug asserts).
+    std::vector<std::vector<Packet>> _queues;
     std::atomic<bool> _mainThreadCaptured{false};
     std::atomic<std::thread::id> _mainThreadId{};
-
-    // Counter for unique connection ids.
     std::atomic<uint64_t> _nextConnectionId{1};
-
-    // Counter for runtime-assigned type ids (above kHandAssignedTypeIdMax).
-    std::atomic<uint32_t> _nextRuntimeTypeId{kHandAssignedTypeIdMax + 1};
-
-    // Phase 2 counters (atomic; design §8).
-    std::atomic<uint64_t> _totalPosted{0};
-    std::atomic<uint64_t> _totalCoalesced{0};
-    std::atomic<uint64_t> _totalDelivered{0};
-    std::atomic<uint64_t> _peakQueueDepth{0};
-
-    // Phase 3: alias map (string → EventTypeId). Separate mutex so string
-    // lookups don't contend with listener-bucket / post-queue locks.
+    std::atomic<uint32_t> _nextRuntimeTypeId{kHandAssignedTypeIdMax+1};
+    std::atomic<uint64_t> _totalPosted{0},_totalCoalesced{0},_totalDelivered{0},_peakQueueDepth{0};
     mutable std::mutex _aliasMutex;
-    std::unordered_map<std::string, EventTypeId> _aliases;
-
+    std::unordered_map<std::string,EventTypeId> _aliases;
     friend class ScopedConnection;
 };
-
-} // namespace ayt::event
+}
